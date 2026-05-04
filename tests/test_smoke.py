@@ -245,6 +245,21 @@ class TestServer:
         assert body["hourly"]["aod"][0] == 0.10
         assert body["_camsMeta"]["source"] == "cams"
 
+    def test_metrics_exposed_in_prometheus_format(self, client_with_cache, monkeypatch):
+        """/metrics returns Prometheus exposition format with the
+        expected counter + gauge series so a scrape can monitor health."""
+        monkeypatch.setenv("MERGE_OPENMETEO", "0")
+        # Trigger a /uv call so counters increment past zero.
+        client_with_cache.get("/uv?latitude=10&longitude=0")
+        r = client_with_cache.get("/metrics")
+        assert r.status_code == 200
+        assert "text/plain" in r.headers.get("content-type", "")
+        body = r.text
+        assert "getbased_uvdata_uv_requests_total" in body
+        assert "getbased_uvdata_uv_requests_2xx" in body
+        assert "getbased_uvdata_snapshot_stale" in body
+        assert 'getbased_uvdata_info{version=' in body
+
     def test_bearer_enforced_when_set(self, monkeypatch):
         from getbased_uvdata.server import app as real_app
         monkeypatch.setenv("GETBASED_UVDATA_BEARER", "secret-token-xyz")

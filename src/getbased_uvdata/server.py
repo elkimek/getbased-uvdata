@@ -10,11 +10,28 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+import time as _time
+
 from . import __version__
 from .auth import check_bearer, required_bearer
 from .cams import CamsCache, background_pull_loop
 from .openmeteo import fetch_openmeteo
 from .reshape import build_response
+
+
+# Counter state — small, in-memory, no Prometheus client lib dep.
+# Increments race-free under FastAPI's single-process model; if you
+# scale horizontally, scrape each worker independently or front them
+# with a histogram-friendly aggregator.
+_metrics: dict[str, int | float] = {
+    "uv_requests_total": 0,
+    "uv_requests_2xx": 0,
+    "uv_requests_4xx": 0,
+    "uv_requests_5xx": 0,
+    "uv_request_duration_sum_sec": 0.0,
+    "openmeteo_merges_total": 0,
+    "openmeteo_merge_failures_total": 0,
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 logger = logging.getLogger(__name__)
@@ -109,12 +126,20 @@ async def uv(
             detail=f"CAMS grid not yet available. Last error: {cache.last_error or 'still pulling'}",
         )
 
+    started = _time.monotonic()
+    _metrics["uv_requests_total"] += 1
+
     when_iso = time or _now_iso_utc()
     when_epoch = _iso_to_epoch(when_iso)
     cams_lookup = snap.lookup(latitude, longitude, when_epoch)
 
     merge = os.environ.get("MERGE_OPENMETEO", "1") not in ("0", "false", "no", "")
-    om = await fetch_openmeteo(latitude, longitude) if merge else None
+    om = None
+    if merge:
+        _metrics["openmeteo_merges_total"] += 1
+        om = await fetch_openmeteo(latitude, longitude)
+        if not om:
+            _metrics["openmeteo_merge_failures_total"] += 1
 
     body = build_response(
         lat=latitude,
@@ -136,7 +161,36 @@ async def uv(
         headers["X-Cams-Stale"] = "1"
     if cache.last_error:
         headers["X-Cams-Last-Error"] = cache.last_error[:200].replace("\n", " ")
+    _metrics["uv_requests_2xx"] += 1
+    _metrics["uv_request_duration_sum_sec"] += _time.monotonic() - started
     return JSONResponse(content=body, headers=headers)
+
+
+@app.get("/metrics")
+async def metrics(request: Request) -> "Response":
+    """Prometheus-compatible plain-text exposition format. Includes the
+    rolling counters above plus snapshot freshness so a scrape detects
+    silent CAMS-pull failure or grid drift without needing a special
+    monitoring agent. No bearer required — same posture as /healthz."""
+    from fastapi.responses import Response
+    cache: CamsCache = request.app.state.cams
+    snap = cache.snapshot
+    lines: list[str] = []
+    lines.append(f"# HELP getbased_uvdata_info Build metadata.")
+    lines.append(f"# TYPE getbased_uvdata_info gauge")
+    lines.append(f'getbased_uvdata_info{{version="{__version__}"}} 1')
+    for k, v in _metrics.items():
+        lines.append(f"# TYPE getbased_uvdata_{k} counter")
+        lines.append(f"getbased_uvdata_{k} {v}")
+    if snap is not None:
+        age = _time.time() - snap.pulled_at
+        lines.append(f"# TYPE getbased_uvdata_snapshot_age_seconds gauge")
+        lines.append(f"getbased_uvdata_snapshot_age_seconds {age:.0f}")
+        lines.append(f"# TYPE getbased_uvdata_snapshot_timesteps gauge")
+        lines.append(f"getbased_uvdata_snapshot_timesteps {len(snap.times)}")
+    lines.append(f"# TYPE getbased_uvdata_snapshot_stale gauge")
+    lines.append(f"getbased_uvdata_snapshot_stale {1 if cache.is_stale else 0}")
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 def _now_iso_utc() -> str:

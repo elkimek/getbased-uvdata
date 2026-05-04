@@ -34,6 +34,8 @@ Then in the app: **Settings → Light & Sun → Sun Data Source → Self-hosted 
 | `CAMS_API_URL` | `https://ads.atmosphere.copernicus.eu/api` | CDS-API endpoint. Override only if you're hitting a mirror. |
 | `CAMS_BBOX` | `90,-180,-90,180` | Region of interest (N,W,S,E in degrees). Smaller box = faster pull + less RAM. |
 | `CAMS_PULL_INTERVAL_SEC` | `21600` | How often to refresh the grid. CAMS publishes every 12 h; 6 h covers a missed cycle. |
+| `CAMS_DATE_OVERRIDE` | _(empty)_ | Force a fixed forecast date (YYYY-MM-DD) instead of "today". Only useful on clock-shifted dev boxes; leave empty in production. |
+| `CAMS_CACHE_DIR` | `/data` | Directory the latest snapshot persists to. On restart the server warm-starts from this file instead of waiting for a fresh CDS pull. Empty string disables persistence. |
 | `GETBASED_UVDATA_BEARER` | _(empty)_ | Token clients must present in `Authorization: Bearer …`. Empty = open public (only safe behind your own access control). |
 | `MERGE_OPENMETEO` | `1` | Merge Open-Meteo clouds/temp/UVI into the response. Set `0` for CAMS-only — useful if you want fewer servers in the data path. |
 | `ALLOWED_ORIGINS` | _(empty)_ | Extra CORS origins (comma-separated) on top of the production app + localhost dev. |
@@ -66,6 +68,33 @@ Liveness + grid metadata:
   }
 }
 ```
+
+### `GET /metrics`
+
+Prometheus-compatible plain-text exposition for scrapers:
+```
+getbased_uvdata_info{version="0.1.0"} 1
+getbased_uvdata_uv_requests_total 142
+getbased_uvdata_uv_requests_2xx 140
+getbased_uvdata_uv_requests_4xx 2
+getbased_uvdata_uv_request_duration_sum_sec 12.4
+getbased_uvdata_openmeteo_merges_total 142
+getbased_uvdata_openmeteo_merge_failures_total 0
+getbased_uvdata_snapshot_age_seconds 7320
+getbased_uvdata_snapshot_timesteps 25
+getbased_uvdata_snapshot_stale 0
+```
+
+No bearer required (same posture as `/healthz`). Useful alerts: `snapshot_stale == 1` (background pull is wedged), `openmeteo_merge_failures_total / merges_total > 0.1` (Open-Meteo flaky), `snapshot_age_seconds > 86400` (grid more than a day old).
+
+## CLI
+
+```bash
+getbased-uvdata          # start the HTTP server (default)
+getbased-uvdata doctor   # one-shot env validation + live CAMS pull + sample lookup
+```
+
+`doctor` exits non-zero on any problem — useful in CI / pre-flight scripts before a deploy.
 
 ## Operational notes
 
