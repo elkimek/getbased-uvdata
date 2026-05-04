@@ -1,8 +1,16 @@
 # Self-host quickstart:
 #   1. Copy .env.example → .env, fill in CAMS_API_KEY + GETBASED_UVDATA_BEARER.
 #   2. docker compose up -d
-#   3. Point Settings → Light & Sun → Sun Data Source at:
-#        http://<your-host>:8324/uv  with the bearer you set above.
+#   3. Front it with TLS via your reverse proxy (Caddy / nginx / Cloudflare).
+#      The container binds to 127.0.0.1:8324 only — never directly exposed
+#      to the public internet without a TLS terminator + rate-limiter
+#      between it and the world. Caddy snippet:
+#
+#         uvdata.getbased.health {
+#           reverse_proxy localhost:8324
+#         }
+#   4. Point Settings → Light & Sun → Sun Data Source at:
+#        https://<your-host>/uv  with the bearer you set above.
 
 services:
   uvdata:
@@ -10,10 +18,20 @@ services:
     image: getbased/uvdata:0.1.0
     restart: unless-stopped
     env_file: .env
+    # 127.0.0.1 binding — public access goes through the host's reverse
+    # proxy, so the container never speaks raw HTTP to the internet.
+    # Self-hosters who want direct exposure (LAN-only, behind a separate
+    # firewall) can override to "0.0.0.0:8324:8324".
     ports:
-      - "8324:8324"
+      - "127.0.0.1:8324:8324"
     volumes:
       - cams-cache:/data
+    # Memory cap — hard ceiling on the container's RSS so an xarray
+    # parse spike or a runaway grid can never starve other services
+    # on the same host (evolu-relay / context-gateway co-tenancy).
+    # Steady state is ~150-200 MB; 512m gives 2-3x headroom for the
+    # 6-hourly CAMS-pull transient.
+    mem_limit: 512m
     logging:
       driver: json-file
       options:
