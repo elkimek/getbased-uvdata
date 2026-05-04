@@ -7,8 +7,9 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 
 import time as _time
 
@@ -155,7 +156,6 @@ async def uv(
     # Stale-grid header — monitors / browser can detect silent
     # staleness without parsing _camsMeta. Body still serves so the
     # session can complete; the browser's own freshness UI flags it.
-    from fastapi.responses import JSONResponse
     headers = {}
     if cache.is_stale:
         headers["X-Cams-Stale"] = "1"
@@ -167,37 +167,36 @@ async def uv(
 
 
 @app.get("/metrics")
-async def metrics(request: Request) -> "Response":
+async def metrics(request: Request) -> Response:
     """Prometheus-compatible plain-text exposition format. Includes the
     rolling counters above plus snapshot freshness so a scrape detects
     silent CAMS-pull failure or grid drift without needing a special
     monitoring agent. No bearer required — same posture as /healthz."""
-    from fastapi.responses import Response
     cache: CamsCache = request.app.state.cams
     snap = cache.snapshot
     lines: list[str] = []
-    lines.append(f"# HELP getbased_uvdata_info Build metadata.")
-    lines.append(f"# TYPE getbased_uvdata_info gauge")
+    lines.append("# HELP getbased_uvdata_info Build metadata.")
+    lines.append("# TYPE getbased_uvdata_info gauge")
     lines.append(f'getbased_uvdata_info{{version="{__version__}"}} 1')
     for k, v in _metrics.items():
         lines.append(f"# TYPE getbased_uvdata_{k} counter")
         lines.append(f"getbased_uvdata_{k} {v}")
     if snap is not None:
         age = _time.time() - snap.pulled_at
-        lines.append(f"# TYPE getbased_uvdata_snapshot_age_seconds gauge")
+        lines.append("# TYPE getbased_uvdata_snapshot_age_seconds gauge")
         lines.append(f"getbased_uvdata_snapshot_age_seconds {age:.0f}")
-        lines.append(f"# TYPE getbased_uvdata_snapshot_timesteps gauge")
+        lines.append("# TYPE getbased_uvdata_snapshot_timesteps gauge")
         lines.append(f"getbased_uvdata_snapshot_timesteps {len(snap.times)}")
-    lines.append(f"# TYPE getbased_uvdata_snapshot_stale gauge")
+    lines.append("# TYPE getbased_uvdata_snapshot_stale gauge")
     lines.append(f"getbased_uvdata_snapshot_stale {1 if cache.is_stale else 0}")
     # Lifetime pull counters — useful to alert on sustained failure.
     # is_stale only flips after 24 h; this surfaces problems within
     # one retry cycle (~minutes).
-    lines.append(f"# TYPE getbased_uvdata_pull_attempts_total counter")
+    lines.append("# TYPE getbased_uvdata_pull_attempts_total counter")
     lines.append(f"getbased_uvdata_pull_attempts_total {getattr(cache, 'pull_attempts', 0)}")
-    lines.append(f"# TYPE getbased_uvdata_pull_successes_total counter")
+    lines.append("# TYPE getbased_uvdata_pull_successes_total counter")
     lines.append(f"getbased_uvdata_pull_successes_total {getattr(cache, 'pull_successes', 0)}")
-    lines.append(f"# TYPE getbased_uvdata_pull_failures_total counter")
+    lines.append("# TYPE getbased_uvdata_pull_failures_total counter")
     lines.append(f"getbased_uvdata_pull_failures_total {getattr(cache, 'pull_failures', 0)}")
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 

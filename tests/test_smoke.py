@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 
 from getbased_uvdata.cams import CamsCache, GridSnapshot
 from getbased_uvdata.reshape import build_response
-from getbased_uvdata.server import app
 
 
 def _fake_snapshot() -> GridSnapshot:
@@ -95,7 +94,6 @@ class TestSnapshotPersistence:
         """A snapshot persisted to disk and reloaded into a fresh
         CamsCache produces identical lookup output — restart warm-start
         works."""
-        from getbased_uvdata.cams import CamsCache
 
         original = _fake_snapshot()
         cache_a = CamsCache(cache_dir=str(tmp_path))
@@ -113,7 +111,6 @@ class TestSnapshotPersistence:
 
     def test_missing_file_is_silent(self, tmp_path):
         """Empty cache directory just yields no snapshot — not an error."""
-        from getbased_uvdata.cams import CamsCache
         cache = CamsCache(cache_dir=str(tmp_path))
         assert cache.snapshot is None
 

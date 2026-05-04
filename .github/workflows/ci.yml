@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install netCDF system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnetcdf-dev libhdf5-dev
+      - name: Install package + dev extras
+        run: pip install -e ".[dev]"
+      - name: Lint with ruff
+        run: ruff check src tests
+      - name: Run tests
+        run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # Build only — we don't push from CI. Smoke-tests the Dockerfile
+      # so a broken multi-stage definition fails fast.
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: getbased/uvdata:ci
+      - name: Sanity-check container starts
+        # Boot the container with a fake CAMS_API_KEY so /healthz responds.
+        # The first pull will fail (auth rejected) but the server stays up
+        # and the endpoint returns 200 with ok:false — exactly what we
+        # want to assert: the container itself is wired correctly.
+        run: |
+          docker run -d --name uvdata -e CAMS_API_KEY=fake -p 8324:8324 getbased/uvdata:ci
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://localhost:8324/healthz > /dev/null; then
+              echo "healthz responded on attempt $i"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8324/healthz | tee /dev/stderr | grep -q '"ok"'
+          docker logs uvdata
+          docker stop uvdata
