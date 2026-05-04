@@ -30,24 +30,36 @@ async def fetch_openmeteo(lat: float, lon: float) -> dict:
     """Pull Open-Meteo hourly forecast + air-quality. Returns merged dict
     with the same shape the browser already parses; never raises (any
     failure logs and returns an empty dict so the caller can degrade)."""
-    fc_url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&hourly=uv_index,uv_index_clear_sky,cloud_cover,temperature_2m"
-        "&daily=sunrise,sunset,uv_index_max"
-        "&timezone=auto&past_days=2&forecast_days=1"
-    )
-    aq_url = (
-        "https://air-quality-api.open-meteo.com/v1/air-quality"
-        f"?latitude={lat}&longitude={lon}"
-        "&hourly=pm10,pm2_5,nitrogen_dioxide,aerosol_optical_depth"
-        "&current=pm2_5,pm10,european_aqi"
-        "&past_days=2"
-    )
+    # Cast defensively — caller is FastAPI with float Query validators,
+    # but this also pins the host of the request away from any value
+    # an attacker could substitute via the lat/lon channel.
+    lat_f = float(lat)
+    lon_f = float(lon)
+    fc_url = "https://api.open-meteo.com/v1/forecast"
+    fc_params = {
+        "latitude": lat_f,
+        "longitude": lon_f,
+        "hourly": "uv_index,uv_index_clear_sky,cloud_cover,temperature_2m",
+        "daily": "sunrise,sunset,uv_index_max",
+        "timezone": "auto",
+        "past_days": 2,
+        "forecast_days": 1,
+    }
+    aq_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    aq_params = {
+        "latitude": lat_f,
+        "longitude": lon_f,
+        "hourly": "pm10,pm2_5,nitrogen_dioxide,aerosol_optical_depth",
+        "current": "pm2_5,pm10,european_aqi",
+        "past_days": 2,
+    }
     out: dict = {}
     try:
         async with httpx.AsyncClient(timeout=_OPENMETEO_TIMEOUT_SEC) as client:
-            fc_resp, aq_resp = await _gather_safe(client.get(fc_url), client.get(aq_url))
+            fc_resp, aq_resp = await _gather_safe(
+                client.get(fc_url, params=fc_params),
+                client.get(aq_url, params=aq_params),
+            )
             if fc_resp is not None and fc_resp.status_code == 200:
                 out["forecast"] = fc_resp.json()
             if aq_resp is not None and aq_resp.status_code == 200:

@@ -56,6 +56,8 @@ async def lifespan(app: FastAPI):
     try:
         await task
     except asyncio.CancelledError:
+        # Expected — we just cancelled the task; awaiting re-raises so
+        # the loop can finish its `finally` blocks. Nothing to handle.
         pass
 
 

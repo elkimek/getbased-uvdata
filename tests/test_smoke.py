@@ -339,6 +339,7 @@ class TestRetryBackoff:
         try:
             await task
         except _asyncio.CancelledError:
+            # Expected after cancel(); swallow so the test continues.
             pass
 
         assert cache.pull_attempts >= 3
