@@ -2,7 +2,7 @@
 #   builder — installs the package + its dev headers (libnetcdf-dev / libhdf5-dev)
 #   runtime — slim image with only the runtime libs + the installed package
 # Saves ~200 MB vs a single stage that ships the dev headers.
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,7 +18,7 @@ COPY src ./src
 RUN pip install --no-cache-dir --prefix=/install .
 
 # ───────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
