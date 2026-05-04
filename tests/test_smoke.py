@@ -18,7 +18,7 @@ from getbased_uvdata.cams import CamsCache, GridSnapshot
 from getbased_uvdata.reshape import build_response
 
 
-def _fake_snapshot() -> GridSnapshot:
+def _fake_snapshot(with_aq: bool = False) -> GridSnapshot:
     """One-hour, 2x2 grid with predictable values for assertion math."""
     now = time.time()
     times = np.array([now], dtype=float)
@@ -26,6 +26,16 @@ def _fake_snapshot() -> GridSnapshot:
     lons = np.array([0.0, 10.0])
     ozone = np.array([[[300.0, 310.0], [320.0, 330.0]]])  # (T, LAT, LON)
     aod = np.array([[[0.10, 0.15], [0.20, 0.25]]])
+    aq_kwargs: dict = {}
+    if with_aq:
+        aq_kwargs = {
+            "pm2_5": np.array([[[5.0, 6.0], [7.0, 8.0]]]),
+            "pm10": np.array([[[10.0, 12.0], [14.0, 16.0]]]),
+            "no2": np.array([[[20.0, 22.0], [24.0, 26.0]]]),
+            "so2": np.array([[[1.0, 1.5], [2.0, 2.5]]]),
+            "co": np.array([[[200.0, 210.0], [220.0, 230.0]]]),
+            "o3_surface": np.array([[[60.0, 65.0], [70.0, 75.0]]]),
+        }
     return GridSnapshot(
         pulled_at=now,
         valid_from=now,
@@ -35,6 +45,7 @@ def _fake_snapshot() -> GridSnapshot:
         lons=lons,
         ozone_du=ozone,
         aod_550=aod,
+        **aq_kwargs,
     )
 
 
@@ -88,6 +99,28 @@ class TestGridLookup:
         out = snap.lookup(10.0, 0.0, snap.times[0] - 86400)
         assert abs(out["ozoneDU"] - 300.0) < 1e-9
 
+    def test_air_quality_fields_surface_when_present(self):
+        """Lookup includes AQ fields when the snapshot carries them.
+        Bilinear interp is the same math as ozone/aod, so verifying
+        midpoint averaging confirms the loop covers every AQ var."""
+        snap = _fake_snapshot(with_aq=True)
+        out = snap.lookup(5.0, 5.0, snap.times[0])
+        # Midpoint of (5,6,7,8) = 6.5 for pm2_5
+        assert abs(out["pm25"] - 6.5) < 1e-9
+        # (200+210+220+230)/4 = 215 for CO
+        assert abs(out["co"] - 215.0) < 1e-9
+        # (60+65+70+75)/4 = 67.5 for surface ozone
+        assert abs(out["o3Surface"] - 67.5) < 1e-9
+
+    def test_air_quality_fields_absent_when_not_pulled(self):
+        """Lookup omits AQ keys entirely when fields are None — no
+        Nones surfacing in the response, no KeyError."""
+        snap = _fake_snapshot(with_aq=False)
+        out = snap.lookup(5.0, 5.0, snap.times[0])
+        assert "pm25" not in out
+        assert "co" not in out
+        assert "ozoneDU" in out  # core field still there
+
 
 class TestSnapshotPersistence:
     def test_save_and_reload_round_trip(self, tmp_path):
@@ -113,6 +146,20 @@ class TestSnapshotPersistence:
         """Empty cache directory just yields no snapshot — not an error."""
         cache = CamsCache(cache_dir=str(tmp_path))
         assert cache.snapshot is None
+
+    def test_aq_fields_round_trip_through_disk(self, tmp_path):
+        """A snapshot WITH air-quality fields persists and reloads
+        them — proving the npz-payload extension works."""
+        original = _fake_snapshot(with_aq=True)
+        cache_a = CamsCache(cache_dir=str(tmp_path))
+        cache_a._snapshot = original  # type: ignore[attr-defined]
+        cache_a._save_to_disk(original)  # type: ignore[attr-defined]
+        cache_b = CamsCache(cache_dir=str(tmp_path))
+        assert cache_b.snapshot is not None
+        out = cache_b.snapshot.lookup(5.0, 5.0, original.times[0])
+        # Same midpoint values as the in-memory test above.
+        assert abs(out["pm25"] - 6.5) < 1e-9
+        assert abs(out["o3Surface"] - 67.5) < 1e-9
 
 
 class TestRetryBackoff:

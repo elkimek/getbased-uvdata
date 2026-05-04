@@ -43,25 +43,36 @@ def build_response(
         hourly = dict(out.get("hourly", {}))
         times = hourly.get("time", [])
         # Per-hour CAMS lookup against the snapshot, so different times
-        # in the response window get the right ozone/AOD (e.g. ozone
-        # has a real diurnal cycle of ~10-15 DU; broadcasting a single
-        # value across 24 h would muddy hours far from `when`). Fall
-        # back to the broadcast scalar when no snapshot is plumbed
-        # through (older callers, tests).
+        # in the response window get the right values (ozone has a real
+        # diurnal cycle of ~10-15 DU; PM2.5 swings 3-5× over a day in
+        # cities). Fall back to the broadcast scalar when no snapshot
+        # is plumbed through (older callers, tests).
         fc_offset_s = float(out.get("utc_offset_seconds") or 0)
-        if snapshot is not None and times:
-            ozone_arr: list[float | None] = []
-            aod_arr: list[float | None] = []
-            for t_str in times:
-                t_epoch = _open_meteo_time_to_epoch(t_str, fc_offset_s)
-                hourly_lookup = snapshot.lookup(lat, lon, t_epoch) if t_epoch is not None else cams_lookup
-                ozone_arr.append(hourly_lookup.get("ozoneDU"))
-                aod_arr.append(hourly_lookup.get("aod"))
-        else:
-            ozone_arr = [cams_lookup.get("ozoneDU")] * len(times)
-            aod_arr = [cams_lookup.get("aod")] * len(times)
-        hourly["ozone_du"] = ozone_arr
-        hourly["aod"] = aod_arr
+        # Field roster — keys here must match GridSnapshot.lookup() output.
+        cams_field_keys = ["ozoneDU", "aod", "pm25", "pm10"]
+        cams_field_to_hourly = {
+            "ozoneDU": "ozone_du",
+            "aod": "aod",
+            "pm25": "pm2_5",
+            "pm10": "pm10",
+        }
+        # Initialise per-field arrays — only emit a key in `hourly` if
+        # SOME hour got a real value (avoids polluting the response
+        # with all-None columns when a field is absent from the
+        # snapshot, e.g. an older persisted cache without AQ fields).
+        per_field: dict[str, list[float | None]] = {k: [] for k in cams_field_keys}
+        for t_str in times:
+            t_epoch = (_open_meteo_time_to_epoch(t_str, fc_offset_s)
+                       if snapshot is not None else None)
+            lookup = (snapshot.lookup(lat, lon, t_epoch)
+                      if (snapshot is not None and t_epoch is not None)
+                      else cams_lookup)
+            for k in cams_field_keys:
+                per_field[k].append(lookup.get(k))
+        for cams_key, hourly_key in cams_field_to_hourly.items():
+            arr = per_field[cams_key]
+            if any(v is not None for v in arr):
+                hourly[hourly_key] = arr
         out["hourly"] = hourly
         # Embed AQ into the same envelope so the browser's existing
         # hourly-parallel scanner finds AOD where it expects.
@@ -86,6 +97,14 @@ def build_response(
                 "temperature_2m": [None],
                 "ozone_du": [cams_lookup.get("ozoneDU")],
                 "aod": [cams_lookup.get("aod")],
+                **(
+                    {"pm2_5": [cams_lookup.get("pm25")]}
+                    if cams_lookup.get("pm25") is not None else {}
+                ),
+                **(
+                    {"pm10": [cams_lookup.get("pm10")]}
+                    if cams_lookup.get("pm10") is not None else {}
+                ),
             },
             "daily": {
                 "time": [when.date().isoformat()],

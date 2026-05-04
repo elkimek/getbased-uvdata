@@ -36,16 +36,36 @@ logger = logging.getLogger(__name__)
 # Variables we ask CAMS for. Names match the CDS-API short-name table for
 # the CAMS global atmospheric composition forecast product. Adjust if
 # Copernicus renames them — they re-key occasionally.
+#
+# UV-math drivers: total column ozone (DU) + aerosol optical depth.
+# Particulate AQ (PM2.5/PM10) replaces Open-Meteo's AQI — CAMS is the
+# actual upstream Open-Meteo wraps for these, so we save a hop and
+# get the original satellite-assimilated values.
+#
+# NOTE: NO2, SO2, CO, surface ozone are NOT available on this dataset
+# at single-level — CAMS silently drops them from the response. They
+# live in the regional `cams-european-air-quality-forecasts` (Europe
+# only) or require a model_level=60 parameter (heavyweight 3D query).
+# Wiring those up is a Phase-2 candidate; for now the browser keeps
+# its existing Open-Meteo AQ fetch when needed.
 _CAMS_DATASET = "cams-global-atmospheric-composition-forecasts"
 _CAMS_VARIABLES = [
     "total_column_ozone",
     "total_aerosol_optical_depth_550nm",
+    "particulate_matter_2.5um",
+    "particulate_matter_10um",
 ]
 
 
 @dataclass
 class GridSnapshot:
-    """One CAMS pull, indexed for O(1) bilinear lookup."""
+    """One CAMS pull, indexed for O(1) bilinear lookup.
+
+    Optional AQ fields default to None when the operator pulls a
+    legacy snapshot from disk (pre-AQ schema). Lookups gracefully skip
+    missing fields rather than crashing, so a smooth migration path
+    exists across version bumps.
+    """
 
     pulled_at: float            # epoch seconds
     valid_from: float           # forecast valid period start
@@ -55,6 +75,12 @@ class GridSnapshot:
     lons: np.ndarray            # (LON,) — typically -180..180
     ozone_du: np.ndarray        # (T, LAT, LON) — Dobson Units
     aod_550: np.ndarray         # (T, LAT, LON) — unitless
+    pm2_5: np.ndarray | None = None       # (T, LAT, LON) — µg/m³
+    pm10: np.ndarray | None = None        # (T, LAT, LON) — µg/m³
+    no2: np.ndarray | None = None         # (T, LAT, LON) — µg/m³ (converted from kg/m³)
+    so2: np.ndarray | None = None         # (T, LAT, LON) — µg/m³
+    co: np.ndarray | None = None          # (T, LAT, LON) — µg/m³
+    o3_surface: np.ndarray | None = None  # (T, LAT, LON) — µg/m³ (tropospheric)
 
     def lookup(self, lat: float, lon: float, when_epoch: float) -> dict[str, float | None]:
         """Bilinear-interpolate the grid at (lat, lon, time). Returns {ozoneDU, aod}.
@@ -124,16 +150,37 @@ class GridSnapshot:
                     + w_lat * (1 - w_lon) * v10
                     + w_lat * w_lon * v11)
 
-        return {
+        out: dict[str, float | None] = {
             "ozoneDU": _bilin(self.ozone_du),
             "aod": _bilin(self.aod_550),
         }
+        for key, arr in self._aq_arrays():
+            if arr is not None:
+                out[key] = _bilin(arr)
+        return out
 
     def _cell(self, ti: int, li: int, gi: int) -> dict[str, float | None]:
-        return {
+        out: dict[str, float | None] = {
             "ozoneDU": float(self.ozone_du[ti, li, gi]),
             "aod": float(self.aod_550[ti, li, gi]),
         }
+        for key, arr in self._aq_arrays():
+            if arr is not None:
+                out[key] = float(arr[ti, li, gi])
+        return out
+
+    def _aq_arrays(self) -> list[tuple[str, np.ndarray | None]]:
+        """Iterable of optional air-quality fields paired with their
+        public response key. Centralises the field roster so the two
+        lookup paths (bilinear + nearest) share the same coverage."""
+        return [
+            ("pm25", self.pm2_5),
+            ("pm10", self.pm10),
+            ("no2", self.no2),
+            ("so2", self.so2),
+            ("co", self.co),
+            ("o3Surface", self.o3_surface),
+        ]
 
     def _nearest_lat_idx(self, lat: float) -> int:
         return int(np.argmin(np.abs(self.lats - lat)))
@@ -226,20 +273,29 @@ class CamsCache:
         half-written file."""
         path = self._disk_path()
         tmp = path + ".tmp"
+        payload: dict[str, np.ndarray] = {
+            "pulled_at": np.float64(snap.pulled_at),
+            "valid_from": np.float64(snap.valid_from),
+            "valid_to": np.float64(snap.valid_to),
+            "times": snap.times,
+            "lats": snap.lats,
+            "lons": snap.lons,
+            "ozone_du": snap.ozone_du,
+            "aod_550": snap.aod_550,
+        }
+        # AQ fields are optional — only persist when present so older
+        # snapshots remain compatible with newer code that gates on
+        # `key in archive` instead of unconditional reads.
+        for name, arr in (
+            ("pm2_5", snap.pm2_5), ("pm10", snap.pm10), ("no2", snap.no2),
+            ("so2", snap.so2), ("co", snap.co), ("o3_surface", snap.o3_surface),
+        ):
+            if arr is not None:
+                payload[name] = arr
         with open(tmp, "wb") as fh:
-            np.savez_compressed(
-                fh,
-                pulled_at=np.float64(snap.pulled_at),
-                valid_from=np.float64(snap.valid_from),
-                valid_to=np.float64(snap.valid_to),
-                times=snap.times,
-                lats=snap.lats,
-                lons=snap.lons,
-                ozone_du=snap.ozone_du,
-                aod_550=snap.aod_550,
-            )
+            np.savez_compressed(fh, **payload)
         os.replace(tmp, path)
-        logger.info("Snapshot persisted to %s", path)
+        logger.info("Snapshot persisted to %s (%d AQ fields)", path, len(payload) - 8)
 
     def _try_load_from_disk(self) -> None:
         """Best-effort load of a previous snapshot at startup. Failure
@@ -249,6 +305,10 @@ class CamsCache:
             return
         try:
             data = np.load(path, allow_pickle=False)
+            def _opt(key: str) -> np.ndarray | None:
+                # `key in data` is supported on NpzFile but cheap to be
+                # defensive — older snapshots predate the AQ fields.
+                return data[key] if key in data.files else None
             self._snapshot = GridSnapshot(
                 pulled_at=float(data["pulled_at"]),
                 valid_from=float(data["valid_from"]),
@@ -258,6 +318,12 @@ class CamsCache:
                 lons=data["lons"],
                 ozone_du=data["ozone_du"],
                 aod_550=data["aod_550"],
+                pm2_5=_opt("pm2_5"),
+                pm10=_opt("pm10"),
+                no2=_opt("no2"),
+                so2=_opt("so2"),
+                co=_opt("co"),
+                o3_surface=_opt("o3_surface"),
             )
             age_h = (time.time() - self._snapshot.pulled_at) / 3600
             logger.info(
@@ -289,10 +355,18 @@ def _pull_cams_blocking() -> GridSnapshot:
 
     client = cdsapi.Client(url=api_url, key=api_key, quiet=True, verify=True)
 
-    # Forecast leadtime hours: 0..24h covers "now plus today + tomorrow's
-    # morning" which is what the app's hourly time-bucket interpolation
-    # needs. We pull only the hourly steps we'll actually serve.
-    leadtimes = [str(h) for h in range(0, 25)]
+    # Forecast leadtime hours: 0..120h = full 5-day forecast horizon
+    # CAMS publishes (daily 00:00 cycle, max leadtime 120). Hourly for
+    # the first 24h matches Open-Meteo's hourly resolution; 3-hourly
+    # beyond that keeps payload manageable while still tracking the
+    # diurnal cycle (~10-15 DU swing). Total: 24 hourly + 32 3-hourly
+    # = 56 timesteps for ~5 days. App-side `nearestHourIndex` snaps
+    # any in-between timestamp to the closest available step.
+    horizon_hours = int(os.environ.get("CAMS_FORECAST_HORIZON_HOURS", "120"))
+    horizon_hours = max(24, min(120, horizon_hours))
+    leadtimes_set: set[int] = set(range(0, 25))
+    leadtimes_set.update(range(27, horizon_hours + 1, 3))
+    leadtimes = [str(h) for h in sorted(leadtimes_set)]
 
     # CAMS publishes forecasts up to ~5 days ahead of the current real-
     # world date. CDS rejects requests with `date` in the future. Any
@@ -332,6 +406,19 @@ def _pull_cams_blocking() -> GridSnapshot:
             "aod_550": "aod_550",          # already-correct passthrough
             "t550aer": "aod_550",
             "tau_550": "aod_550",          # forecast-product variant
+            # Air-quality (surface) — CAMS short names are stable for
+            # the AQ fields. Add aliases as Copernicus rotates them.
+            "pm2p5": "pm2_5",
+            "pm2_5": "pm2_5",
+            "pm10": "pm10",
+            "no2": "no2",
+            "so2": "so2",
+            "co": "co",
+            # Surface ozone (tropospheric) shares its short-name with
+            # total-column in some legacy products; the dataset variant
+            # we request keeps them disambiguated. If `go3` already got
+            # routed to ozone_du above, this branch is never hit.
+            "o3": "o3_surface",
         }
         renamed = {}
         for cds_name, our_name in var_map.items():
@@ -368,6 +455,28 @@ def _pull_cams_blocking() -> GridSnapshot:
                 f"CAMS aod_550 array has unexpected shape {aod.shape} after squeeze; expected (T, LAT, LON)"
             )
 
+        # Air-quality fields. CAMS units for these are kg/m³ at the
+        # surface; convert to µg/m³ (1 kg/m³ = 1e9 µg/m³). Missing
+        # variables (older snapshots, partial pulls) stay None — the
+        # consumer skips them gracefully.
+        def _aq(name: str) -> np.ndarray | None:
+            if name not in ds:
+                return None
+            arr = np.squeeze(ds[name].values)
+            if arr.ndim != 3:
+                return None
+            units = ds[name].attrs.get("units", "").lower()
+            if "kg" in units:
+                arr = arr * 1e9
+            return arr
+
+        pm2_5 = _aq("pm2_5")
+        pm10 = _aq("pm10")
+        no2 = _aq("no2")
+        so2 = _aq("so2")
+        co = _aq("co")
+        o3_surface = _aq("o3_surface")
+
         # Time axis: CAMS uses CDS-MAGICS conventions — `valid_time` is
         # the per-step timestamp we want (= forecast_reference_time +
         # forecast_period). When a request fixes `time: 00:00` and asks
@@ -383,10 +492,24 @@ def _pull_cams_blocking() -> GridSnapshot:
         lons = ds["longitude"].values.astype(float)
 
         # Sort lats descending (CAMS convention) so np.argmin behaves.
+        # The same flip must reach every (T, LAT, LON) data array — UV
+        # drivers AND AQ fields — otherwise their index math diverges.
         if lats[0] < lats[-1]:
             lats = lats[::-1]
             ozone = ozone[:, ::-1, :]
             aod = aod[:, ::-1, :]
+            if pm2_5 is not None:
+                pm2_5 = pm2_5[:, ::-1, :]
+            if pm10 is not None:
+                pm10 = pm10[:, ::-1, :]
+            if no2 is not None:
+                no2 = no2[:, ::-1, :]
+            if so2 is not None:
+                so2 = so2[:, ::-1, :]
+            if co is not None:
+                co = co[:, ::-1, :]
+            if o3_surface is not None:
+                o3_surface = o3_surface[:, ::-1, :]
 
         return GridSnapshot(
             pulled_at=time.time(),
@@ -397,6 +520,12 @@ def _pull_cams_blocking() -> GridSnapshot:
             lons=lons,
             ozone_du=ozone,
             aod_550=aod,
+            pm2_5=pm2_5,
+            pm10=pm10,
+            no2=no2,
+            so2=so2,
+            co=co,
+            o3_surface=o3_surface,
         )
 
 
