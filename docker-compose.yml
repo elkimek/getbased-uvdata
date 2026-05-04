@@ -1,0 +1,24 @@
+# Self-host quickstart:
+#   1. Copy .env.example → .env, fill in CAMS_API_KEY + GETBASED_UVDATA_BEARER.
+#   2. docker compose up -d
+#   3. Point Settings → Light & Sun → Sun Data Source at:
+#        http://<your-host>:8324/uv  with the bearer you set above.
+
+services:
+  uvdata:
+    build: .
+    image: getbased/uvdata:0.1.0
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8324:8324"
+    volumes:
+      - cams-cache:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  cams-cache:
