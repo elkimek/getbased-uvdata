@@ -162,6 +162,78 @@ class TestSnapshotPersistence:
         assert abs(out["o3Surface"] - 67.5) < 1e-9
 
 
+class TestSpectrum:
+    """Bird-Riordan port pinned against published TUV/NIWA reference
+    points so it stays in lockstep with js/sun-spectrum.js. If either
+    side drifts, both these and the JS test-sun-spectrum suite catch it."""
+
+    def test_extraterrestrial_irradiance_anchors(self):
+        from getbased_uvdata.spectrum import extraterrestrial_irradiance
+        # Anchor points from ASTM E490 — must match exactly (same table).
+        assert abs(extraterrestrial_irradiance(300) - 0.541) < 1e-6
+        assert abs(extraterrestrial_irradiance(450) - 2.066) < 1e-6
+        # Linear interp at 310 nm = 300 + 50% of (320 - 300) = 0.541 + 0.5*(0.815-0.541)
+        assert abs(extraterrestrial_irradiance(310) - 0.678) < 1e-3
+
+    def test_erythemal_action_spectrum(self):
+        from getbased_uvdata.spectrum import erythemal_at
+        # Plateau in the UVB peak
+        assert erythemal_at(280) == 1.0
+        assert erythemal_at(298) == 1.0
+        # 313 nm: 10^(0.094*(298-313)) = 10^-1.41 ≈ 0.039
+        assert abs(erythemal_at(313) - 10 ** (0.094 * (298 - 313))) < 1e-9
+        # Long-UVA tail at 380 nm: 10^(0.015*(140-380)) = 10^-3.6 ≈ 2.5e-4
+        assert erythemal_at(380) > 0
+        assert erythemal_at(380) < 1e-3
+        assert erythemal_at(401) == 0.0
+
+    def test_ozone_absorption_table_interpolation(self):
+        from getbased_uvdata.spectrum import ozone_absorption
+        # Direct table hit at 305 nm (UVB-cutoff sensitive wavelength).
+        # σ = 1.50e-19 cm² × 2.69e19 normalisation = 4.035 unitless.
+        assert abs(ozone_absorption(305) - 4.035) < 0.01
+        # Log-space interp at 308 nm should fall between 305 and 310.
+        s305 = ozone_absorption(305)
+        s310 = ozone_absorption(310)
+        s308 = ozone_absorption(308)
+        # In log-space, s308 should be between s305 and s310
+        assert s310 < s308 < s305
+
+    def test_reconstruct_spectrum_zero_below_horizon(self):
+        from getbased_uvdata.spectrum import reconstruct_spectrum
+        spec = reconstruct_spectrum(zenith_deg=90, ozone_du=300, altitude_m=0, cloud_cover=0)
+        assert all(v == 0 for v in spec.irradiance)
+
+    def test_reconstruct_spectrum_clear_noon_uvi_in_band(self):
+        """At zenith=30° / 300 DU / sea level / no cloud the implied UVI
+        should land 5-9 (real summer-noon midlatitude UVI ~7-8)."""
+        from getbased_uvdata.spectrum import reconstruct_spectrum, uvi_from_spectrum
+        spec = reconstruct_spectrum(zenith_deg=30, ozone_du=300, altitude_m=0, cloud_cover=0)
+        uvi = uvi_from_spectrum(spec)
+        assert 5.0 < uvi < 9.0, f"got UVI {uvi:.2f}, expected 5-9"
+
+    def test_reconstruct_spectrum_lower_uvi_at_low_sun(self):
+        from getbased_uvdata.spectrum import reconstruct_spectrum, uvi_from_spectrum
+        # Same atmosphere, two zenith angles — the lower sun must
+        # produce a lower UVI through path-length attenuation alone.
+        spec_high = reconstruct_spectrum(zenith_deg=30, ozone_du=300, altitude_m=0, cloud_cover=0)
+        spec_low = reconstruct_spectrum(zenith_deg=70, ozone_du=300, altitude_m=0, cloud_cover=0)
+        assert uvi_from_spectrum(spec_high) > uvi_from_spectrum(spec_low) * 5
+
+    def test_solar_zenith_angle_noon_at_equator(self):
+        """Noon UTC at (0°N, 0°E) on the equinox → near-zero zenith."""
+        from getbased_uvdata.spectrum import solar_zenith_angle
+        # 2024-03-21 12:00 UTC = roughly equinox noon at Greenwich
+        z = solar_zenith_angle(1711022400, 0, 0)
+        assert z < 5, f"got {z:.2f}° expected <5°"
+
+    def test_solar_zenith_angle_midnight_below_horizon(self):
+        from getbased_uvdata.spectrum import solar_zenith_angle
+        # 2024-06-21 00:00 UTC at (50°N, 0°E) — midnight, sun well below horizon
+        z = solar_zenith_angle(1718928000, 50, 0)
+        assert z > 90, f"got {z:.2f}° expected >90°"
+
+
 class TestRetryBackoff:
     @pytest.mark.asyncio
     async def test_backoff_retries_on_failure_then_recovers(self, monkeypatch):
