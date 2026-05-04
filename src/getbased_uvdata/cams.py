@@ -148,13 +148,25 @@ class CamsCache:
     Threading model: the background pull writes to `_snapshot` under a
     lock; readers grab the reference (atomic) and the snapshot itself is
     immutable, so no read lock is needed.
+
+    Persistence: when `cache_dir` is set, the snapshot is saved as an
+    npz on every successful pull and reloaded on startup so a process
+    restart doesn't fall through to 503 for 30 s – 5 min while CDS
+    queues the first request. Stale-on-disk snapshots are still loaded;
+    `is_stale` reflects their age the same way fresh-pull snapshots do.
     """
 
-    def __init__(self) -> None:
+    SNAPSHOT_FILENAME = "cams-snapshot.npz"
+
+    def __init__(self, cache_dir: str | None = None) -> None:
         self._snapshot: GridSnapshot | None = None
         self._lock = asyncio.Lock()
         self._last_error: str | None = None
         self._last_pull_attempt: float = 0.0
+        self._cache_dir = cache_dir
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            self._try_load_from_disk()
 
     @property
     def snapshot(self) -> GridSnapshot | None:
@@ -181,11 +193,70 @@ class CamsCache:
                 self._last_error = None
                 logger.info("CAMS pull OK: %s timesteps, %s lats, %s lons",
                             len(snap.times), len(snap.lats), len(snap.lons))
+                if self._cache_dir:
+                    try:
+                        self._save_to_disk(snap)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Snapshot persist failed: %s", e)
                 return True
             except Exception as e:  # noqa: BLE001 — we WANT to keep serving stale on failure
                 self._last_error = f"{type(e).__name__}: {e}"
                 logger.exception("CAMS pull failed")
                 return False
+
+    # ── Disk persistence ─────────────────────────────────────────────
+
+    def _disk_path(self) -> str:
+        return os.path.join(self._cache_dir or ".", self.SNAPSHOT_FILENAME)
+
+    def _save_to_disk(self, snap: GridSnapshot) -> None:
+        """Persist the snapshot as an npz so the next process boot can
+        warm-start instead of waiting for CDS to queue a fresh request.
+        Writes via a file handle to bypass np.savez's auto-`.npz`
+        extension, then renames atomically so readers never see a
+        half-written file."""
+        path = self._disk_path()
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(
+                fh,
+                pulled_at=np.float64(snap.pulled_at),
+                valid_from=np.float64(snap.valid_from),
+                valid_to=np.float64(snap.valid_to),
+                times=snap.times,
+                lats=snap.lats,
+                lons=snap.lons,
+                ozone_du=snap.ozone_du,
+                aod_550=snap.aod_550,
+            )
+        os.replace(tmp, path)
+        logger.info("Snapshot persisted to %s", path)
+
+    def _try_load_from_disk(self) -> None:
+        """Best-effort load of a previous snapshot at startup. Failure
+        is logged + swallowed; the background pull will refresh anyway."""
+        path = self._disk_path()
+        if not os.path.exists(path):
+            return
+        try:
+            data = np.load(path, allow_pickle=False)
+            self._snapshot = GridSnapshot(
+                pulled_at=float(data["pulled_at"]),
+                valid_from=float(data["valid_from"]),
+                valid_to=float(data["valid_to"]),
+                times=data["times"],
+                lats=data["lats"],
+                lons=data["lons"],
+                ozone_du=data["ozone_du"],
+                aod_550=data["aod_550"],
+            )
+            age_h = (time.time() - self._snapshot.pulled_at) / 3600
+            logger.info(
+                "Loaded snapshot from disk: %.1f h old, %s timesteps",
+                age_h, len(self._snapshot.times),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to load snapshot from %s: %s", path, e)
 
 
 def _pull_cams_blocking() -> GridSnapshot:

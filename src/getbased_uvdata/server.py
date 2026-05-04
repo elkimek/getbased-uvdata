@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cache = CamsCache()
+    cache_dir = os.environ.get("CAMS_CACHE_DIR", "/data").strip() or None
+    cache = CamsCache(cache_dir=cache_dir)
     interval = int(os.environ.get("CAMS_PULL_INTERVAL_SEC", "21600"))
     task = asyncio.create_task(background_pull_loop(cache, interval))
     app.state.cams = cache

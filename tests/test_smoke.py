@@ -90,6 +90,34 @@ class TestGridLookup:
         assert abs(out["ozoneDU"] - 300.0) < 1e-9
 
 
+class TestSnapshotPersistence:
+    def test_save_and_reload_round_trip(self, tmp_path):
+        """A snapshot persisted to disk and reloaded into a fresh
+        CamsCache produces identical lookup output — restart warm-start
+        works."""
+        from getbased_uvdata.cams import CamsCache
+
+        original = _fake_snapshot()
+        cache_a = CamsCache(cache_dir=str(tmp_path))
+        cache_a._snapshot = original  # type: ignore[attr-defined]
+        cache_a._save_to_disk(original)  # type: ignore[attr-defined]
+        # Fresh cache instance reads the file on init.
+        cache_b = CamsCache(cache_dir=str(tmp_path))
+        assert cache_b.snapshot is not None
+        # Lookups match between original and reloaded snapshots.
+        for lat, lon in [(10.0, 0.0), (5.0, 5.0), (0.0, 10.0)]:
+            a = original.lookup(lat, lon, original.times[0])
+            b = cache_b.snapshot.lookup(lat, lon, original.times[0])
+            assert abs(a["ozoneDU"] - b["ozoneDU"]) < 1e-9
+            assert abs(a["aod"] - b["aod"]) < 1e-9
+
+    def test_missing_file_is_silent(self, tmp_path):
+        """Empty cache directory just yields no snapshot — not an error."""
+        from getbased_uvdata.cams import CamsCache
+        cache = CamsCache(cache_dir=str(tmp_path))
+        assert cache.snapshot is None
+
+
 class TestReshape:
     def test_cams_only_envelope_is_open_meteo_shaped(self):
         cams = {"ozoneDU": 305.0, "aod": 0.12}
@@ -187,10 +215,11 @@ class TestServer:
     def client_with_cache(self, monkeypatch):
         # Skip the real lifespan / CDS-API pull by injecting a fake cache
         # straight into app.state. TestClient still wires routes correctly.
+        # Disable the disk cache (default /data needs root) so lifespan's
+        # mkdirs doesn't blow up before we get to inject our fake.
+        monkeypatch.setenv("CAMS_CACHE_DIR", "")
         from getbased_uvdata.server import app as real_app
         client = TestClient(real_app)
-        # TestClient's __enter__ runs lifespan; we replace the cache it
-        # populated with our deterministic one.
         with client:
             real_app.state.cams = type("FakeCache", (), {
                 "snapshot": _fake_snapshot(),
@@ -220,6 +249,7 @@ class TestServer:
         from getbased_uvdata.server import app as real_app
         monkeypatch.setenv("GETBASED_UVDATA_BEARER", "secret-token-xyz")
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
+        monkeypatch.setenv("CAMS_CACHE_DIR", "")
         client = TestClient(real_app)
         with client:
             real_app.state.cams = type("FakeCache", (), {
