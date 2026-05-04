@@ -156,11 +156,66 @@ def _iso_to_epoch(iso: str) -> float:
 
 
 def main() -> None:
-    """Console-script entry point — `getbased-uvdata`."""
+    """Console-script entry point — `getbased-uvdata [doctor]`.
+
+    With no args: starts the HTTP server (the normal mode).
+    With `doctor`: runs a one-shot self-test — env validation + a
+    single CAMS pull + a sample lookup. Exits non-zero on any
+    problem so it's useful in CI / pre-flight scripts.
+    """
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        sys.exit(_doctor())
     import uvicorn
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8324"))
     uvicorn.run("getbased_uvdata.server:app", host=host, port=port, log_level="info")
+
+
+def _doctor() -> int:
+    """One-shot env + CAMS connectivity check. Returns shell exit code."""
+    print(f"getbased-uvdata doctor v{__version__}")
+    print("=" * 60)
+    ok = True
+
+    # Env presence checks — fail fast if the operator forgot to source .env.
+    cams_key = os.environ.get("CAMS_API_KEY", "").strip()
+    if not cams_key:
+        print("✗ CAMS_API_KEY not set (register at https://ads.atmosphere.copernicus.eu and put your key in .env)")
+        ok = False
+    else:
+        masked = cams_key[:6] + "…" + cams_key[-4:] if len(cams_key) > 12 else "(short)"
+        print(f"✓ CAMS_API_KEY set [{masked}]")
+
+    bearer = os.environ.get("GETBASED_UVDATA_BEARER", "").strip()
+    if not bearer:
+        print("⚠ GETBASED_UVDATA_BEARER unset — server will run in OPEN mode (anyone reaching the port can query CAMS).")
+    else:
+        print(f"✓ GETBASED_UVDATA_BEARER set [{len(bearer)} chars]")
+
+    bbox = os.environ.get("CAMS_BBOX", "90,-180,-90,180")
+    print(f"✓ CAMS_BBOX={bbox}")
+
+    if not ok:
+        print("\nFix the ✗ items above before running the server.")
+        return 1
+
+    # Live pull — this is the slow part; surface progress so the user
+    # knows the doctor isn't hung.
+    print("\nAttempting a live CAMS pull (30 s – 5 min depending on CDS queue)…")
+    try:
+        from .cams import _pull_cams_blocking  # type: ignore
+        snap = _pull_cams_blocking()
+    except Exception as e:  # noqa: BLE001
+        print(f"✗ CAMS pull failed: {type(e).__name__}: {e}")
+        return 2
+    print(f"✓ CAMS pull OK — {len(snap.times)} hourly steps, {len(snap.lats)} lats, {len(snap.lons)} lons")
+
+    # Sample lookup at a fixed point.
+    sample = snap.lookup(lat=50.0, lon=14.0, when_epoch=snap.times[0])
+    print(f"✓ Sample at (50N, 14E) → ozoneDU={sample['ozoneDU']:.1f}  AOD={sample['aod']:.3f}")
+    print("\nAll checks passed. Run `getbased-uvdata` (no args) to start the server.")
+    return 0
 
 
 if __name__ == "__main__":

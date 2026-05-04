@@ -40,21 +40,54 @@ def _fake_snapshot() -> GridSnapshot:
 
 
 class TestGridLookup:
-    def test_nearest_grid_point(self):
+    def test_exact_grid_corner(self):
         snap = _fake_snapshot()
-        # exact grid coords return the corresponding cell
+        # Exact grid coords still return the corresponding cell — bilinear
+        # weights collapse to 1.0/0.0 at the corners.
         out = snap.lookup(10.0, 0.0, snap.times[0])
-        assert out["ozoneDU"] == 300.0
-        assert out["aod"] == 0.10
+        assert abs(out["ozoneDU"] - 300.0) < 1e-9
+        assert abs(out["aod"] - 0.10) < 1e-9
         out = snap.lookup(0.0, 10.0, snap.times[0])
-        assert out["ozoneDU"] == 330.0
-        assert out["aod"] == 0.25
+        assert abs(out["ozoneDU"] - 330.0) < 1e-9
+        assert abs(out["aod"] - 0.25) < 1e-9
+
+    def test_bilinear_midpoint(self):
+        """Centre of the 2×2 cell averages the four corners."""
+        snap = _fake_snapshot()
+        # Corners: (10,0)=300, (10,10)=310, (0,0)=320, (0,10)=330.
+        # Centre (5,5) → (300+310+320+330)/4 = 315.
+        out = snap.lookup(5.0, 5.0, snap.times[0])
+        assert abs(out["ozoneDU"] - 315.0) < 1e-9
+        # AOD same: (0.10+0.15+0.20+0.25)/4 = 0.175
+        assert abs(out["aod"] - 0.175) < 1e-9
+
+    def test_bilinear_off_centre(self):
+        """Quarter into the cell weights closer corners more."""
+        snap = _fake_snapshot()
+        # (lat=7.5, lon=2.5) — 25% from (10,0), 75% from the row
+        # that mixes (10,0) and (10,10).
+        out = snap.lookup(7.5, 2.5, snap.times[0])
+        # Expected:
+        #  w_lat: lats are [10, 0]; 7.5 between → (7.5-10)/(0-10)=0.25
+        #  w_lon: lons are [0, 10]; 2.5 between → 0.25
+        #  v = (1-0.25)(1-0.25)*300 + (1-0.25)*0.25*310
+        #    + 0.25*(1-0.25)*320 + 0.25*0.25*330
+        expected = 0.5625*300 + 0.1875*310 + 0.1875*320 + 0.0625*330
+        assert abs(out["ozoneDU"] - expected) < 1e-9
+
+    def test_outside_bbox_falls_back_to_nearest(self):
+        """Points outside the grid's bounding box use nearest-cell, not extrapolation."""
+        snap = _fake_snapshot()
+        # lat=20 is north of the grid (grid lats are 10, 0). Should
+        # snap to the lat=10 row.
+        out = snap.lookup(20.0, 0.0, snap.times[0])
+        assert abs(out["ozoneDU"] - 300.0) < 1e-9
 
     def test_clamps_outside_time_window(self):
         snap = _fake_snapshot()
         # Way before the snapshot — clamps to first timestep, not 404.
         out = snap.lookup(10.0, 0.0, snap.times[0] - 86400)
-        assert out["ozoneDU"] == 300.0
+        assert abs(out["ozoneDU"] - 300.0) < 1e-9
 
 
 class TestReshape:

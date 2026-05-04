@@ -57,33 +57,89 @@ class GridSnapshot:
     aod_550: np.ndarray         # (T, LAT, LON) — unitless
 
     def lookup(self, lat: float, lon: float, when_epoch: float) -> dict[str, float | None]:
-        """Bilinear interpolate the grid at (lat, lon, time). Returns {ozoneDU, aod}."""
+        """Bilinear-interpolate the grid at (lat, lon, time). Returns {ozoneDU, aod}.
+
+        Time axis snaps to the nearest forecast hour (CAMS leadtimes are
+        already 1-hour-granular). Spatial axes interpolate between the
+        four corner cells — at 0.4° resolution that's ~44 km error if
+        we picked just the nearest cell, vs ~5 km when bilinear weighs
+        the corners by Euclidean fraction. Material near coastlines and
+        topographic boundaries where ozone/AOD gradients are steep.
+        """
+        # ── time axis (nearest forecast hour) ────────────────────────
         if when_epoch < self.times[0] or when_epoch > self.times[-1]:
-            # Fall through to nearest forecast hour rather than refusing —
-            # a request just outside the forecast window (clock drift,
-            # boundary tick) shouldn't 404.
             ti = 0 if when_epoch < self.times[0] else len(self.times) - 1
         else:
             ti = int(np.searchsorted(self.times, when_epoch))
             if ti >= len(self.times):
                 ti = len(self.times) - 1
-        # Wrap longitude into the grid's range.
+
+        # ── longitude wrap to the grid's domain ──────────────────────
         lon_wrapped = lon
         lon_min, lon_max = float(self.lons.min()), float(self.lons.max())
         if lon < lon_min:
             lon_wrapped = lon + 360
         elif lon > lon_max:
             lon_wrapped = lon - 360
-        # Lat / lon nearest-neighbour for v0.1 — bilinear in a future
-        # bump. Grid resolution is 0.4° (~44 km); for a chemistry value
-        # like total column ozone the spatial gradient is gentle enough
-        # that nearest-neighbour error is well under model uncertainty.
-        li = int(np.argmin(np.abs(self.lats - lat)))
-        gi = int(np.argmin(np.abs(self.lons - lon_wrapped)))
+
+        # ── bilinear over the 2x2 cell containing (lat, lon) ─────────
+        # CAMS lats descend (90 → -90), so np.searchsorted on REVERSED
+        # lats finds the upper edge; map back to the original index.
+        # If outside the grid's bounding box, fall back to nearest cell.
+        if lat > self.lats[0] or lat < self.lats[-1]:
+            li = int(np.argmin(np.abs(self.lats - lat)))
+            return self._cell(ti, li, self._nearest_lon_idx(lon_wrapped))
+        if lon_wrapped < self.lons[0] or lon_wrapped > self.lons[-1]:
+            gi = int(np.argmin(np.abs(self.lons - lon_wrapped)))
+            return self._cell(ti, self._nearest_lat_idx(lat), gi)
+
+        # Find the two grid lines that bracket the point. For a degenerate
+        # 1-row or 1-column grid (test fixtures, regional pulls), fall back
+        # to nearest-cell — bilinear math collapses to identity anyway.
+        if len(self.lats) < 2 or len(self.lons) < 2:
+            return self._cell(ti, self._nearest_lat_idx(lat), self._nearest_lon_idx(lon_wrapped))
+        diffs = np.abs(self.lats - lat)
+        li_a, li_b = sorted(np.argsort(diffs)[:2].tolist())
+
+        gi_diffs = np.abs(self.lons - lon_wrapped)
+        gi_a, gi_b = sorted(np.argsort(gi_diffs)[:2].tolist())
+
+        # Fractional weights — closer cell carries more weight.
+        lat_a, lat_b = float(self.lats[li_a]), float(self.lats[li_b])
+        lon_a, lon_b = float(self.lons[gi_a]), float(self.lons[gi_b])
+        w_lat = 0.5 if lat_a == lat_b else (lat - lat_a) / (lat_b - lat_a)
+        w_lon = 0.5 if lon_a == lon_b else (lon_wrapped - lon_a) / (lon_b - lon_a)
+        # Clamp to [0,1] in case lat == grid edge and rounding pushes it
+        # microscopically out of range.
+        w_lat = max(0.0, min(1.0, w_lat))
+        w_lon = max(0.0, min(1.0, w_lon))
+
+        def _bilin(arr: np.ndarray) -> float:
+            v00 = float(arr[ti, li_a, gi_a])
+            v01 = float(arr[ti, li_a, gi_b])
+            v10 = float(arr[ti, li_b, gi_a])
+            v11 = float(arr[ti, li_b, gi_b])
+            return ((1 - w_lat) * (1 - w_lon) * v00
+                    + (1 - w_lat) * w_lon * v01
+                    + w_lat * (1 - w_lon) * v10
+                    + w_lat * w_lon * v11)
+
+        return {
+            "ozoneDU": _bilin(self.ozone_du),
+            "aod": _bilin(self.aod_550),
+        }
+
+    def _cell(self, ti: int, li: int, gi: int) -> dict[str, float | None]:
         return {
             "ozoneDU": float(self.ozone_du[ti, li, gi]),
             "aod": float(self.aod_550[ti, li, gi]),
         }
+
+    def _nearest_lat_idx(self, lat: float) -> int:
+        return int(np.argmin(np.abs(self.lats - lat)))
+
+    def _nearest_lon_idx(self, lon: float) -> int:
+        return int(np.argmin(np.abs(self.lons - lon)))
 
 
 class CamsCache:
