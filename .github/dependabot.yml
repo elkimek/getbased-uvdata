@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # Python deps — weekly auto-PR for the top-level pyproject.toml deps.
+  # Test the upper-bound regimes (cdsapi, fastapi, uvicorn) where API-
+  # surface drift has historically broken us.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions — keep workflow actions current, especially as the
+  # Node.js 20 → 24 deprecation propagates.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+
+  # Docker base image — track python:3.12-slim moving forward through
+  # security updates without our intervention.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"
