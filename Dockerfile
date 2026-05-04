@@ -25,9 +25,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH=/install/bin:$PATH \
     PYTHONPATH=/install/lib/python3.12/site-packages
 
-# Only the runtime libs — no dev headers. curl is for the healthcheck.
+# Only curl (for the healthcheck) + ca-certs (for HTTPS to CDS-API).
+# The netCDF4 / xarray Python wheels ship their own bundled libnetcdf
+# + libhdf5 in manylinux wheels — we don't need apt-installed runtime
+# libs (the package names also drift per Debian release: libnetcdf19
+# in bookworm, libnetcdf22 in trixie, etc — fragile to pin).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libnetcdf19 libhdf5-103-1t64 curl ca-certificates \
+        curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. /data is the default cache dir and must be writable
