@@ -82,7 +82,7 @@ class TestGridLookup:
         #  w_lon: lons are [0, 10]; 2.5 between → 0.25
         #  v = (1-0.25)(1-0.25)*300 + (1-0.25)*0.25*310
         #    + 0.25*(1-0.25)*320 + 0.25*0.25*330
-        expected = 0.5625*300 + 0.1875*310 + 0.1875*320 + 0.0625*330
+        expected = 0.5625 * 300 + 0.1875 * 310 + 0.1875 * 320 + 0.0625 * 330
         assert abs(out["ozoneDU"] - expected) < 1e-9
 
     def test_outside_bbox_falls_back_to_nearest(self):
@@ -162,6 +162,33 @@ class TestSnapshotPersistence:
         assert abs(out["o3Surface"] - 67.5) < 1e-9
 
 
+class TestRedaction:
+    def test_redact_secrets_strips_live_values(self, monkeypatch):
+        """`_redact_secrets` MUST scrub live env-var values from any
+        string before it reaches /healthz, response headers, or logs.
+        Critical: cdsapi exception strings can include the API key in
+        the URL and the bearer in 401 bodies."""
+        from getbased_uvdata.cams import _redact_secrets
+
+        monkeypatch.setenv("CAMS_API_KEY", "abcdef-1234567890")
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "secret-bearer-token-xyz")
+        msg = "HTTPError: 401 from https://ads...api/?key=abcdef-1234567890 (bearer secret-bearer-token-xyz)"
+        out = _redact_secrets(msg)
+        assert "abcdef-1234567890" not in out
+        assert "secret-bearer-token-xyz" not in out
+        assert "<CAMS_API_KEY-redacted>" in out
+        assert "<GETBASED_UVDATA_BEARER-redacted>" in out
+
+    def test_redact_secrets_skips_short_values(self, monkeypatch):
+        """Don't replace empty / very-short env values — they'd match
+        too aggressively."""
+        from getbased_uvdata.cams import _redact_secrets
+
+        monkeypatch.setenv("CAMS_API_KEY", "")
+        out = _redact_secrets("error: connection refused")
+        assert out == "error: connection refused"
+
+
 class TestSpectrum:
     """Bird-Riordan port pinned against published TUV/NIWA reference
     points so it stays in lockstep with js/sun-spectrum.js. If either
@@ -169,6 +196,7 @@ class TestSpectrum:
 
     def test_extraterrestrial_irradiance_anchors(self):
         from getbased_uvdata.spectrum import extraterrestrial_irradiance
+
         # Anchor points from ASTM E490 — must match exactly (same table).
         assert abs(extraterrestrial_irradiance(300) - 0.541) < 1e-6
         assert abs(extraterrestrial_irradiance(450) - 2.066) < 1e-6
@@ -177,6 +205,7 @@ class TestSpectrum:
 
     def test_erythemal_action_spectrum(self):
         from getbased_uvdata.spectrum import erythemal_at
+
         # Plateau in the UVB peak
         assert erythemal_at(280) == 1.0
         assert erythemal_at(298) == 1.0
@@ -189,6 +218,7 @@ class TestSpectrum:
 
     def test_ozone_absorption_table_interpolation(self):
         from getbased_uvdata.spectrum import ozone_absorption
+
         # Direct table hit at 305 nm (UVB-cutoff sensitive wavelength).
         # σ = 1.50e-19 cm² × 2.69e19 normalisation = 4.035 unitless.
         assert abs(ozone_absorption(305) - 4.035) < 0.01
@@ -201,6 +231,7 @@ class TestSpectrum:
 
     def test_reconstruct_spectrum_zero_below_horizon(self):
         from getbased_uvdata.spectrum import reconstruct_spectrum
+
         spec = reconstruct_spectrum(zenith_deg=90, ozone_du=300, altitude_m=0, cloud_cover=0)
         assert all(v == 0 for v in spec.irradiance)
 
@@ -208,12 +239,14 @@ class TestSpectrum:
         """At zenith=30° / 300 DU / sea level / no cloud the implied UVI
         should land 5-9 (real summer-noon midlatitude UVI ~7-8)."""
         from getbased_uvdata.spectrum import reconstruct_spectrum, uvi_from_spectrum
+
         spec = reconstruct_spectrum(zenith_deg=30, ozone_du=300, altitude_m=0, cloud_cover=0)
         uvi = uvi_from_spectrum(spec)
         assert 5.0 < uvi < 9.0, f"got UVI {uvi:.2f}, expected 5-9"
 
     def test_reconstruct_spectrum_lower_uvi_at_low_sun(self):
         from getbased_uvdata.spectrum import reconstruct_spectrum, uvi_from_spectrum
+
         # Same atmosphere, two zenith angles — the lower sun must
         # produce a lower UVI through path-length attenuation alone.
         spec_high = reconstruct_spectrum(zenith_deg=30, ozone_du=300, altitude_m=0, cloud_cover=0)
@@ -223,15 +256,34 @@ class TestSpectrum:
     def test_solar_zenith_angle_noon_at_equator(self):
         """Noon UTC at (0°N, 0°E) on the equinox → near-zero zenith."""
         from getbased_uvdata.spectrum import solar_zenith_angle
+
         # 2024-03-21 12:00 UTC = roughly equinox noon at Greenwich
         z = solar_zenith_angle(1711022400, 0, 0)
         assert z < 5, f"got {z:.2f}° expected <5°"
 
     def test_solar_zenith_angle_midnight_below_horizon(self):
         from getbased_uvdata.spectrum import solar_zenith_angle
+
         # 2024-06-21 00:00 UTC at (50°N, 0°E) — midnight, sun well below horizon
         z = solar_zenith_angle(1718928000, 50, 0)
         assert z > 90, f"got {z:.2f}° expected >90°"
+
+    def test_solar_zenith_angle_js_lockstep_anchor(self):
+        """JS lockstep: at 2024-06-01 12:00 UTC at (50°N, 14°E)
+        (Prague past-solar-noon, ~13:00 local solar time given +56 min
+        longitudinal offset) the formula produces a zenith of ~30.2°.
+        Anchored to a manual computation of the JS implementation
+        (declination ~22.1°, hour-angle ~14.6°, cos(zenith) ~0.865).
+
+        If this test fails the Python port has drifted from
+        `js/sun-uvdata.js solarZenithAngle` — that's a P0 lockstep
+        bug because /spectrum responses would no longer match what
+        the browser would compute locally for the same coords. Fix
+        by aligning both sides simultaneously, never just here."""
+        from getbased_uvdata.spectrum import solar_zenith_angle
+
+        z = solar_zenith_angle(1717243200, 50.0, 14.0)
+        assert 29.5 < z < 31.0, f"got {z:.2f}° expected 30.0-30.5 (JS lockstep)"
 
 
 class TestRetryBackoff:
@@ -303,9 +355,14 @@ class TestReshape:
     def test_cams_only_envelope_is_open_meteo_shaped(self):
         cams = {"ozoneDU": 305.0, "aod": 0.12}
         resp = build_response(
-            lat=50.0, lon=14.0, when_iso=None,
-            cams_lookup=cams, openmeteo=None,
-            cams_pulled_at=1700000000, snapshot_valid_from=1700000000, snapshot_valid_to=1700086400,
+            lat=50.0,
+            lon=14.0,
+            when_iso=None,
+            cams_lookup=cams,
+            openmeteo=None,
+            cams_pulled_at=1700000000,
+            snapshot_valid_from=1700000000,
+            snapshot_valid_to=1700086400,
         )
         # Browser parser expects these keys.
         assert "hourly" in resp
@@ -330,9 +387,14 @@ class TestReshape:
             "airQuality": {"current": {"european_aqi": 30}},
         }
         resp = build_response(
-            lat=50.0, lon=14.0, when_iso="2026-05-04T10:30",
-            cams_lookup=cams, openmeteo=om,
-            cams_pulled_at=1700000000, snapshot_valid_from=1700000000, snapshot_valid_to=1700086400,
+            lat=50.0,
+            lon=14.0,
+            when_iso="2026-05-04T10:30",
+            cams_lookup=cams,
+            openmeteo=om,
+            cams_pulled_at=1700000000,
+            snapshot_valid_from=1700000000,
+            snapshot_valid_to=1700086400,
         )
         # No snapshot plumbed through → fall back to broadcasting the
         # single CAMS lookup across every hourly entry.
@@ -377,10 +439,13 @@ class TestReshape:
             },
         }
         resp = build_response(
-            lat=50.0, lon=14.0, when_iso="2024-06-01T11:30Z",
+            lat=50.0,
+            lon=14.0,
+            when_iso="2024-06-01T11:30Z",
             cams_lookup={"ozoneDU": -999, "aod": -999},  # should NOT leak through
             openmeteo=om,
-            cams_pulled_at=_time.time(), snapshot_valid_from=1717239600.0,
+            cams_pulled_at=_time.time(),
+            snapshot_valid_from=1717239600.0,
             snapshot_valid_to=1717243200.0,
             snapshot=snap,
         )
@@ -400,13 +465,18 @@ class TestServer:
         # mkdirs doesn't blow up before we get to inject our fake.
         monkeypatch.setenv("CAMS_CACHE_DIR", "")
         from getbased_uvdata.server import app as real_app
+
         client = TestClient(real_app)
         with client:
-            real_app.state.cams = type("FakeCache", (), {
-                "snapshot": _fake_snapshot(),
-                "is_stale": False,
-                "last_error": None,
-            })()
+            real_app.state.cams = type(
+                "FakeCache",
+                (),
+                {
+                    "snapshot": _fake_snapshot(),
+                    "is_stale": False,
+                    "last_error": None,
+                },
+            )()
             yield client
 
     def test_healthz_reports_grid_metadata(self, client_with_cache):
@@ -414,7 +484,10 @@ class TestServer:
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True
-        assert body["cams"]["last_error"] is None
+        # last_error is intentionally NOT exposed on the open /healthz
+        # endpoint — see the security audit. It lives on /metrics behind
+        # the bearer.
+        assert "last_error" not in body["cams"]
 
     def test_uv_returns_cams_fields(self, client_with_cache, monkeypatch):
         # Disable Open-Meteo merge so we don't make real outbound calls.
@@ -426,11 +499,18 @@ class TestServer:
         assert body["hourly"]["aod"][0] == 0.10
         assert body["_camsMeta"]["source"] == "cams"
 
+    def test_metrics_requires_bearer_when_set(self, client_with_cache, monkeypatch):
+        """/metrics is bearer-gated — no exposure of internal pull
+        state to unauthenticated callers."""
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "metrics-secret")
+        r = client_with_cache.get("/metrics")
+        assert r.status_code == 401
+
     def test_metrics_exposed_in_prometheus_format(self, client_with_cache, monkeypatch):
         """/metrics returns Prometheus exposition format with the
         expected counter + gauge series so a scrape can monitor health."""
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
-        # Trigger a /uv call so counters increment past zero.
+        # No bearer set in fixture env → /metrics is open here.
         client_with_cache.get("/uv?latitude=10&longitude=0")
         r = client_with_cache.get("/metrics")
         assert r.status_code == 200
@@ -439,20 +519,52 @@ class TestServer:
         assert "getbased_uvdata_uv_requests_total" in body
         assert "getbased_uvdata_uv_requests_2xx" in body
         assert "getbased_uvdata_snapshot_stale" in body
-        assert 'getbased_uvdata_info{version=' in body
+        assert "getbased_uvdata_info{version=" in body
+
+    def test_iso_time_400_on_garbage(self, client_with_cache, monkeypatch):
+        """Malformed time string returns 400, not silent fallback to now."""
+        monkeypatch.setenv("MERGE_OPENMETEO", "0")
+        r = client_with_cache.get("/uv?latitude=10&longitude=0&time=not-a-date")
+        assert r.status_code == 400
+        assert "invalid iso-8601" in r.text.lower()
+
+    def test_no_cams_last_error_header_on_uv(self, client_with_cache, monkeypatch):
+        """X-Cams-Last-Error header should NOT leak from /uv — even
+        when an error is set on the cache, it stays internal."""
+        monkeypatch.setenv("MERGE_OPENMETEO", "0")
+        from getbased_uvdata.server import app as real_app
+
+        # Inject a fake error on the cache.
+        real_app.state.cams = type(
+            "FakeCacheWithErr",
+            (),
+            {
+                "snapshot": _fake_snapshot(),
+                "is_stale": False,
+                "last_error": "FakeError: secret-leak",
+            },
+        )()
+        r = client_with_cache.get("/uv?latitude=10&longitude=0")
+        assert r.status_code == 200
+        assert "x-cams-last-error" not in {k.lower() for k in r.headers}
 
     def test_bearer_enforced_when_set(self, monkeypatch):
         from getbased_uvdata.server import app as real_app
+
         monkeypatch.setenv("GETBASED_UVDATA_BEARER", "secret-token-xyz")
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
         monkeypatch.setenv("CAMS_CACHE_DIR", "")
         client = TestClient(real_app)
         with client:
-            real_app.state.cams = type("FakeCache", (), {
-                "snapshot": _fake_snapshot(),
-                "is_stale": False,
-                "last_error": None,
-            })()
+            real_app.state.cams = type(
+                "FakeCache",
+                (),
+                {
+                    "snapshot": _fake_snapshot(),
+                    "is_stale": False,
+                    "last_error": None,
+                },
+            )()
             # No bearer → 401
             r = client.get("/uv?latitude=10&longitude=0")
             assert r.status_code == 401

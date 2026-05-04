@@ -47,7 +47,22 @@ def build_response(
         # diurnal cycle of ~10-15 DU; PM2.5 swings 3-5× over a day in
         # cities). Fall back to the broadcast scalar when no snapshot
         # is plumbed through (older callers, tests).
-        fc_offset_s = float(out.get("utc_offset_seconds") or 0)
+        # `utc_offset_seconds`: distinguish missing (None → can't parse
+        # the local-clock strings safely; broadcast) from explicit 0
+        # (UTC; parse as-is). Open-Meteo always emits the field with
+        # timezone=auto, but a future endpoint variant or partial
+        # response shouldn't silently mis-shift hours.
+        raw_offset = out.get("utc_offset_seconds")
+        fc_offset_s: float | None = (
+            float(raw_offset) if isinstance(raw_offset, (int, float)) else None
+        )
+        if fc_offset_s is None and times:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "Open-Meteo response missing utc_offset_seconds; "
+                "broadcasting CAMS scalar across hourly array"
+            )
         # Field roster — keys here must match GridSnapshot.lookup() output.
         cams_field_keys = ["ozoneDU", "aod", "pm25", "pm10"]
         cams_field_to_hourly = {
@@ -62,11 +77,14 @@ def build_response(
         # snapshot, e.g. an older persisted cache without AQ fields).
         per_field: dict[str, list[float | None]] = {k: [] for k in cams_field_keys}
         for t_str in times:
-            t_epoch = (_open_meteo_time_to_epoch(t_str, fc_offset_s)
-                       if snapshot is not None else None)
-            lookup = (snapshot.lookup(lat, lon, t_epoch)
-                      if (snapshot is not None and t_epoch is not None)
-                      else cams_lookup)
+            t_epoch = None
+            if snapshot is not None and fc_offset_s is not None:
+                t_epoch = _open_meteo_time_to_epoch(t_str, fc_offset_s)
+            lookup = (
+                snapshot.lookup(lat, lon, t_epoch)
+                if (snapshot is not None and t_epoch is not None)
+                else cams_lookup
+            )
             for k in cams_field_keys:
                 per_field[k].append(lookup.get(k))
         for cams_key, hourly_key in cams_field_to_hourly.items():
@@ -99,11 +117,13 @@ def build_response(
                 "aod": [cams_lookup.get("aod")],
                 **(
                     {"pm2_5": [cams_lookup.get("pm25")]}
-                    if cams_lookup.get("pm25") is not None else {}
+                    if cams_lookup.get("pm25") is not None
+                    else {}
                 ),
                 **(
                     {"pm10": [cams_lookup.get("pm10")]}
-                    if cams_lookup.get("pm10") is not None else {}
+                    if cams_lookup.get("pm10") is not None
+                    else {}
                 ),
             },
             "daily": {

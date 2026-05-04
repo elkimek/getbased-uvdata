@@ -10,13 +10,13 @@ network on the request hot path.
 What we pull from CAMS:
   • total_column_ozone          → Dobson Units (drives UVB transmission)
   • total_aerosol_optical_depth → 550 nm AOD (modulates UVA/UVB scatter)
+  • particulate_matter_2.5um    → surface PM2.5, µg/m³
+  • particulate_matter_10um     → surface PM10, µg/m³
 
-What we DON'T pull (yet):
-  • UV spectra / surface UV irradiance — CAMS-McRad outputs these but
-    via a different product family (Solar Radiation Service) with
-    different licensing. Phase-2 candidate; for now we feed the ozone
-    + AOD into the browser's Bird-Riordan engine which already handles
-    the radiative transfer.
+UV spectra come from `spectrum.reconstruct_spectrum` fed these CAMS
+values rather than from CAMS-McRad — the Solar Radiation Service is
+queue-based with pre-registered locations, structurally incompatible
+with synchronous per-coord serving.
 """
 
 from __future__ import annotations
@@ -42,12 +42,18 @@ logger = logging.getLogger(__name__)
 # actual upstream Open-Meteo wraps for these, so we save a hop and
 # get the original satellite-assimilated values.
 #
-# NOTE: NO2, SO2, CO, surface ozone are NOT available on this dataset
-# at single-level — CAMS silently drops them from the response. They
+# We DON'T fetch UV spectra / surface UV irradiance from CAMS-McRad —
+# that product is gated behind pre-registered locations + queue-based
+# file delivery, which doesn't fit a synchronous per-coord API. The
+# /spectrum endpoint runs Bird-Riordan + Bass-Paur server-side, fed
+# the real ozone DU + AOD from this pull, which gets us close enough
+# without the architectural mismatch.
+#
+# NO2, SO2, CO, surface ozone are NOT available on this dataset at
+# single-level — CAMS silently drops them from the response. They
 # live in the regional `cams-european-air-quality-forecasts` (Europe
 # only) or require a model_level=60 parameter (heavyweight 3D query).
-# Wiring those up is a Phase-2 candidate; for now the browser keeps
-# its existing Open-Meteo AQ fetch when needed.
+# Phase-2 candidate; for now Open-Meteo's AQI endpoint covers these.
 _CAMS_DATASET = "cams-global-atmospheric-composition-forecasts"
 _CAMS_VARIABLES = [
     "total_column_ozone",
@@ -55,6 +61,26 @@ _CAMS_VARIABLES = [
     "particulate_matter_2.5um",
     "particulate_matter_10um",
 ]
+
+
+def _redact_secrets(s: str) -> str:
+    """Strip live CAMS_API_KEY / GETBASED_UVDATA_BEARER values from a
+    string before it lands in /healthz, response headers, or stdout.
+
+    cdsapi exception strings can include the request URL with the API
+    key embedded in the path / Authorization header; FastAPI exception
+    handlers can include the bearer when validation rejects an Authn
+    header. Replace either with `<redacted>` so the unauthenticated
+    /healthz response and X-Cams-Last-Error header don't side-channel
+    them out.
+    """
+    if not s:
+        return s
+    for env_var in ("CAMS_API_KEY", "GETBASED_UVDATA_BEARER"):
+        v = os.environ.get(env_var, "").strip()
+        if v and len(v) >= 8:
+            s = s.replace(v, f"<{env_var}-redacted>")
+    return s
 
 
 @dataclass
@@ -67,19 +93,19 @@ class GridSnapshot:
     exists across version bumps.
     """
 
-    pulled_at: float            # epoch seconds
-    valid_from: float           # forecast valid period start
-    valid_to: float             # forecast valid period end
-    times: np.ndarray           # (T,) — epoch seconds for each forecast hour
-    lats: np.ndarray            # (LAT,) — descending (CAMS convention)
-    lons: np.ndarray            # (LON,) — typically -180..180
-    ozone_du: np.ndarray        # (T, LAT, LON) — Dobson Units
-    aod_550: np.ndarray         # (T, LAT, LON) — unitless
-    pm2_5: np.ndarray | None = None       # (T, LAT, LON) — µg/m³
-    pm10: np.ndarray | None = None        # (T, LAT, LON) — µg/m³
-    no2: np.ndarray | None = None         # (T, LAT, LON) — µg/m³ (converted from kg/m³)
-    so2: np.ndarray | None = None         # (T, LAT, LON) — µg/m³
-    co: np.ndarray | None = None          # (T, LAT, LON) — µg/m³
+    pulled_at: float  # epoch seconds
+    valid_from: float  # forecast valid period start
+    valid_to: float  # forecast valid period end
+    times: np.ndarray  # (T,) — epoch seconds for each forecast hour
+    lats: np.ndarray  # (LAT,) — descending (CAMS convention)
+    lons: np.ndarray  # (LON,) — typically -180..180
+    ozone_du: np.ndarray  # (T, LAT, LON) — Dobson Units
+    aod_550: np.ndarray  # (T, LAT, LON) — unitless
+    pm2_5: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
+    pm10: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
+    no2: np.ndarray | None = None  # (T, LAT, LON) — µg/m³ (converted from kg/m³)
+    so2: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
+    co: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
     o3_surface: np.ndarray | None = None  # (T, LAT, LON) — µg/m³ (tropospheric)
 
     def lookup(self, lat: float, lon: float, when_epoch: float) -> dict[str, float | None]:
@@ -145,10 +171,12 @@ class GridSnapshot:
             v01 = float(arr[ti, li_a, gi_b])
             v10 = float(arr[ti, li_b, gi_a])
             v11 = float(arr[ti, li_b, gi_b])
-            return ((1 - w_lat) * (1 - w_lon) * v00
-                    + (1 - w_lat) * w_lon * v01
-                    + w_lat * (1 - w_lon) * v10
-                    + w_lat * w_lon * v11)
+            return (
+                (1 - w_lat) * (1 - w_lon) * v00
+                + (1 - w_lat) * w_lon * v01
+                + w_lat * (1 - w_lon) * v10
+                + w_lat * w_lon * v11
+            )
 
         out: dict[str, float | None] = {
             "ozoneDU": _bilin(self.ozone_du),
@@ -242,20 +270,40 @@ class CamsCache:
             self._last_pull_attempt = time.time()
             self.pull_attempts += 1
             try:
-                snap = await asyncio.to_thread(_pull_cams_blocking)
+                # Bound the CDS-API call so a hung pull doesn't wedge the
+                # background loop forever (no failures counted, no
+                # retries fired). Default 10 min — covers the worst-case
+                # CDS queue we've seen, well below any operator's idea
+                # of "too slow."
+                timeout = float(os.environ.get("CAMS_PULL_TIMEOUT_SEC", "600"))
+                snap = await asyncio.wait_for(
+                    asyncio.to_thread(_pull_cams_blocking),
+                    timeout=timeout,
+                )
                 self._snapshot = snap
                 self._last_error = None
                 self.pull_successes += 1
-                logger.info("CAMS pull OK: %s timesteps, %s lats, %s lons",
-                            len(snap.times), len(snap.lats), len(snap.lons))
+                logger.info(
+                    "CAMS pull OK: %s timesteps, %s lats, %s lons",
+                    len(snap.times),
+                    len(snap.lats),
+                    len(snap.lons),
+                )
                 if self._cache_dir:
                     try:
                         self._save_to_disk(snap)
                     except Exception as e:  # noqa: BLE001
-                        logger.warning("Snapshot persist failed: %s", e)
+                        logger.warning("Snapshot persist failed: %s", _redact_secrets(str(e)))
                 return True
             except Exception as e:  # noqa: BLE001 — we WANT to keep serving stale on failure
-                self._last_error = f"{type(e).__name__}: {e}"
+                # Redact secrets BEFORE storing on the cache — the
+                # value flows into /healthz JSON, the X-Cams-Last-Error
+                # response header, and stdout via logger.exception.
+                # cdsapi-style errors have a documented history of
+                # including the request URL with the API key embedded
+                # in their .args; keep them out of unauthenticated
+                # observability surfaces.
+                self._last_error = _redact_secrets(f"{type(e).__name__}: {e}")
                 self.pull_failures += 1
                 logger.exception("CAMS pull failed")
                 return False
@@ -268,11 +316,17 @@ class CamsCache:
     def _save_to_disk(self, snap: GridSnapshot) -> None:
         """Persist the snapshot as an npz so the next process boot can
         warm-start instead of waiting for CDS to queue a fresh request.
-        Writes via a file handle to bypass np.savez's auto-`.npz`
-        extension, then renames atomically so readers never see a
-        half-written file."""
+
+        np.savez owns the file handle (no manual `with open()` wrap) so
+        the ZipFile inside savez can flush its central directory before
+        the underlying file closes — passing our own handle had a
+        documented "I/O on closed file" failure mode on some numpy +
+        filesystem combinations. We let savez add its `.npz` suffix to
+        the temp name, then rename to the canonical filename atomically.
+        """
         path = self._disk_path()
-        tmp = path + ".tmp"
+        tmp_base = path + ".tmp"  # savez appends .npz → tmp_base.npz
+        tmp_full = tmp_base + ".npz"
         payload: dict[str, np.ndarray] = {
             "pulled_at": np.float64(snap.pulled_at),
             "valid_from": np.float64(snap.valid_from),
@@ -287,14 +341,17 @@ class CamsCache:
         # snapshots remain compatible with newer code that gates on
         # `key in archive` instead of unconditional reads.
         for name, arr in (
-            ("pm2_5", snap.pm2_5), ("pm10", snap.pm10), ("no2", snap.no2),
-            ("so2", snap.so2), ("co", snap.co), ("o3_surface", snap.o3_surface),
+            ("pm2_5", snap.pm2_5),
+            ("pm10", snap.pm10),
+            ("no2", snap.no2),
+            ("so2", snap.so2),
+            ("co", snap.co),
+            ("o3_surface", snap.o3_surface),
         ):
             if arr is not None:
                 payload[name] = arr
-        with open(tmp, "wb") as fh:
-            np.savez_compressed(fh, **payload)
-        os.replace(tmp, path)
+        np.savez_compressed(tmp_base, **payload)
+        os.replace(tmp_full, path)
         logger.info("Snapshot persisted to %s (%d AQ fields)", path, len(payload) - 8)
 
     def _try_load_from_disk(self) -> None:
@@ -305,10 +362,12 @@ class CamsCache:
             return
         try:
             data = np.load(path, allow_pickle=False)
+
             def _opt(key: str) -> np.ndarray | None:
                 # `key in data` is supported on NpzFile but cheap to be
                 # defensive — older snapshots predate the AQ fields.
                 return data[key] if key in data.files else None
+
             self._snapshot = GridSnapshot(
                 pulled_at=float(data["pulled_at"]),
                 valid_from=float(data["valid_from"]),
@@ -328,7 +387,8 @@ class CamsCache:
             age_h = (time.time() - self._snapshot.pulled_at) / 3600
             logger.info(
                 "Loaded snapshot from disk: %.1f h old, %s timesteps",
-                age_h, len(self._snapshot.times),
+                age_h,
+                len(self._snapshot.times),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to load snapshot from %s: %s", path, e)
@@ -355,13 +415,13 @@ def _pull_cams_blocking() -> GridSnapshot:
 
     client = cdsapi.Client(url=api_url, key=api_key, quiet=True, verify=True)
 
-    # Forecast leadtime hours: 0..120h = full 5-day forecast horizon
-    # CAMS publishes (daily 00:00 cycle, max leadtime 120). Hourly for
+    # Forecast leadtime hours: 0..N where N = CAMS_FORECAST_HORIZON_HOURS
+    # (default 120, max 120 — CAMS daily 00:00 cycle). Hourly through
     # the first 24h matches Open-Meteo's hourly resolution; 3-hourly
     # beyond that keeps payload manageable while still tracking the
-    # diurnal cycle (~10-15 DU swing). Total: 24 hourly + 32 3-hourly
-    # = 56 timesteps for ~5 days. App-side `nearestHourIndex` snaps
-    # any in-between timestamp to the closest available step.
+    # diurnal cycle (~10-15 DU swing on ozone). App-side
+    # `nearestHourIndex` snaps any in-between timestamp to the closest
+    # available step.
     horizon_hours = int(os.environ.get("CAMS_FORECAST_HORIZON_HOURS", "120"))
     horizon_hours = max(24, min(120, horizon_hours))
     leadtimes_set: set[int] = set(range(0, 25))
@@ -399,13 +459,13 @@ def _pull_cams_blocking() -> GridSnapshot:
         # Variable rename: CDS short names are stable but verbose; map to
         # our internal keys here so the rest of the code stays clean.
         var_map = {
-            "gtco3": "ozone_du",           # current CAMS short name (since 2023)
-            "tco3": "ozone_du",             # legacy short name
-            "go3": "ozone_du",             # alternate name some products use
+            "gtco3": "ozone_du",  # current CAMS short name (since 2023)
+            "tco3": "ozone_du",  # legacy short name
+            "go3": "ozone_du",  # alternate name some products use
             "aod550": "aod_550",
-            "aod_550": "aod_550",          # already-correct passthrough
+            "aod_550": "aod_550",  # already-correct passthrough
             "t550aer": "aod_550",
-            "tau_550": "aod_550",          # forecast-product variant
+            "tau_550": "aod_550",  # forecast-product variant
             # Air-quality (surface) — CAMS short names are stable for
             # the AQ fields. Add aliases as Copernicus rotates them.
             "pm2p5": "pm2_5",
@@ -458,16 +518,30 @@ def _pull_cams_blocking() -> GridSnapshot:
         # Air-quality fields. CAMS units for these are kg/m³ at the
         # surface; convert to µg/m³ (1 kg/m³ = 1e9 µg/m³). Missing
         # variables (older snapshots, partial pulls) stay None — the
-        # consumer skips them gracefully.
+        # consumer skips them gracefully. Unit detection pins to the
+        # expected per-volume form; matching just `"kg"` would also
+        # accept `kg/m²` (column burden) which would silently produce
+        # nonsense if CAMS ever changed its product.
+        _KG_VOLUME_UNITS = ("kg m**-3", "kg/m**3", "kg/m^3", "kg m^-3", "kg.m-3")
+
         def _aq(name: str) -> np.ndarray | None:
             if name not in ds:
                 return None
             arr = np.squeeze(ds[name].values)
             if arr.ndim != 3:
                 return None
-            units = ds[name].attrs.get("units", "").lower()
-            if "kg" in units:
+            units = ds[name].attrs.get("units", "").lower().replace(" ", "")
+            if any(u.replace(" ", "") in units for u in _KG_VOLUME_UNITS):
                 arr = arr * 1e9
+            elif "kg" in units:
+                # Unknown kg-based unit — skip the convert + warn. The
+                # raw value still flows through; downstream consumers
+                # can still detect anomalies via range checks.
+                logger.warning(
+                    "CAMS field %s has unrecognised kg-based unit %r; leaving raw",
+                    name,
+                    units,
+                )
             return arr
 
         pm2_5 = _aq("pm2_5")
@@ -486,8 +560,9 @@ def _pull_cams_blocking() -> GridSnapshot:
         # corresponding lead dimension on the data variables below.
         time_var = "valid_time" if "valid_time" in ds else "time"
         raw_times = ds[time_var].values
-        times = (np.asarray(raw_times).reshape(-1).astype("datetime64[s]")
-                                  .astype(np.int64).astype(float))
+        times = (
+            np.asarray(raw_times).reshape(-1).astype("datetime64[s]").astype(np.int64).astype(float)
+        )
         lats = ds["latitude"].values.astype(float)
         lons = ds["longitude"].values.astype(float)
 
@@ -511,6 +586,30 @@ def _pull_cams_blocking() -> GridSnapshot:
             if o3_surface is not None:
                 o3_surface = o3_surface[:, ::-1, :]
 
+        # Sort the time axis ascending so np.searchsorted in lookup() is
+        # sound. With mixed 1h/3h leadtimes (cams.py request shape),
+        # CAMS happens to return them in order today, but xarray's
+        # coordinate handling isn't a contract we should rely on — a
+        # silently-unsorted axis would corrupt every per-hour lookup
+        # with no error surfacing.
+        if not np.all(np.diff(times) >= 0):
+            order = np.argsort(times)
+            times = times[order]
+            ozone = ozone[order, :, :]
+            aod = aod[order, :, :]
+            if pm2_5 is not None:
+                pm2_5 = pm2_5[order, :, :]
+            if pm10 is not None:
+                pm10 = pm10[order, :, :]
+            if no2 is not None:
+                no2 = no2[order, :, :]
+            if so2 is not None:
+                so2 = so2[order, :, :]
+            if co is not None:
+                co = co[order, :, :]
+            if o3_surface is not None:
+                o3_surface = o3_surface[order, :, :]
+
         return GridSnapshot(
             pulled_at=time.time(),
             valid_from=float(times[0]),
@@ -532,7 +631,8 @@ def _pull_cams_blocking() -> GridSnapshot:
 def _today_utc_iso() -> str:
     """UTC date string for the CDS request 'date' field."""
     import datetime as dt
-    return dt.datetime.utcnow().strftime("%Y-%m-%d")
+
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
 
 
 def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
@@ -550,9 +650,7 @@ def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
         with zipfile.ZipFile(downloaded) as zf:
             nc_members = [n for n in zf.namelist() if n.lower().endswith(".nc")]
             if not nc_members:
-                raise RuntimeError(
-                    f"CAMS zip contains no .nc file. Members: {zf.namelist()}"
-                )
+                raise RuntimeError(f"CAMS zip contains no .nc file. Members: {zf.namelist()}")
             # CDS occasionally splits per-variable into separate .nc files.
             # Prefer the largest one (the merged forecast); the small ones
             # are typically per-step companions we don't need.
@@ -601,7 +699,8 @@ async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
         # capped so we never block longer than the nominal interval.
         logger.warning(
             "CAMS pull failed; retrying in %d s (next backoff: %d s)",
-            backoff, min(backoff * 2, MAX_BACKOFF_SEC),
+            backoff,
+            min(backoff * 2, MAX_BACKOFF_SEC),
         )
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, MAX_BACKOFF_SEC)

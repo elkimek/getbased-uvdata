@@ -47,9 +47,7 @@ async def fetch_openmeteo(lat: float, lon: float) -> dict:
     out: dict = {}
     try:
         async with httpx.AsyncClient(timeout=_OPENMETEO_TIMEOUT_SEC) as client:
-            fc_resp, aq_resp = await _gather_safe(
-                client.get(fc_url), client.get(aq_url)
-            )
+            fc_resp, aq_resp = await _gather_safe(client.get(fc_url), client.get(aq_url))
             if fc_resp is not None and fc_resp.status_code == 200:
                 out["forecast"] = fc_resp.json()
             if aq_resp is not None and aq_resp.status_code == 200:
@@ -64,5 +62,6 @@ async def _gather_safe(*coros):
     in their slot. Saves the caller from littering try/except for each
     side of the parallel fetch."""
     import asyncio
+
     results = await asyncio.gather(*coros, return_exceptions=True)
     return [None if isinstance(r, Exception) else r for r in results]

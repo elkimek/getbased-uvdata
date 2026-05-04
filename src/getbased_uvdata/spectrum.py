@@ -90,7 +90,7 @@ _O3_NORM = 2.69e19
 
 def ozone_absorption(nm: float) -> float:
     """Returns ozone absorption coefficient such that
-        τ_O3(λ, DU) = ozone_absorption(λ) × (DU / 1000) × airMass."""
+    τ_O3(λ, DU) = ozone_absorption(λ) × (DU / 1000) × airMass."""
     if nm < 600:
         if nm <= _O3_XSEC_TABLE[0][0]:
             return _O3_XSEC_TABLE[0][1] * _O3_NORM
@@ -104,20 +104,36 @@ def ozone_absorption(nm: float) -> float:
             if n1 <= nm < n2:
                 t = (nm - n1) / (n2 - n1)
                 log_sigma = math.log10(s1) + t * (math.log10(s2) - math.log10(s1))
-                return (10 ** log_sigma) * _O3_NORM
+                return (10**log_sigma) * _O3_NORM
     # Chappuis band (visible, weak)
     if nm < 700:
-        return 0.4 * math.exp(-((nm - 600) / 60) ** 2)
+        return 0.4 * math.exp(-(((nm - 600) / 60) ** 2))
     return 0.01
 
 
 # ── Extraterrestrial irradiance (ASTM E490 fit) ───────────────────────
 _TOA_POINTS: list[tuple[float, float]] = [
-    (280, 0.082), (300, 0.541), (320, 0.815), (340, 1.057), (360, 1.080),
-    (380, 1.146), (400, 1.486), (420, 1.700), (450, 2.066), (500, 1.929),
-    (550, 1.812), (600, 1.694), (650, 1.515), (700, 1.350), (800, 1.054),
-    (900, 0.807), (1000, 0.620), (1200, 0.380), (1500, 0.205),
-    (2000, 0.103), (2500, 0.038),
+    (280, 0.082),
+    (300, 0.541),
+    (320, 0.815),
+    (340, 1.057),
+    (360, 1.080),
+    (380, 1.146),
+    (400, 1.486),
+    (420, 1.700),
+    (450, 2.066),
+    (500, 1.929),
+    (550, 1.812),
+    (600, 1.694),
+    (650, 1.515),
+    (700, 1.350),
+    (800, 1.054),
+    (900, 0.807),
+    (1000, 0.620),
+    (1200, 0.380),
+    (1500, 0.205),
+    (2000, 0.103),
+    (2500, 0.038),
 ]
 
 
@@ -170,7 +186,7 @@ def reconstruct_spectrum(
         e0 = extraterrestrial_irradiance(nm)
         lambda_um = nm / 1000.0
         # Rayleigh
-        tau_r = alt_scale / (lambda_um ** 4 * (115.6406 - 1.335 / (lambda_um ** 2)))
+        tau_r = alt_scale / (lambda_um**4 * (115.6406 - 1.335 / (lambda_um**2)))
         tr = math.exp(-tau_r * air_mass)
         # Ozone (Bass-Paur)
         tau_o3 = ozone_absorption(nm) * (ozone_du / 1000.0)
@@ -222,31 +238,46 @@ def uvi_from_spectrum(spectrum: Spectrum) -> float:
 
 
 def solar_zenith_angle(when_epoch: float, lat: float, lon: float) -> float:
-    """Approximate solar zenith angle in degrees at (lat, lon, time).
-    NOAA solar position algorithm — accurate to ~0.5° at midlatitudes.
-
-    Mirrors the browser's window.solarZenithAngle helper. Day-of-year +
-    fractional hour drives declination; latitude + hour-angle give
-    altitude, which we 90°-subtract for zenith."""
+    """Solar zenith angle in degrees at (lat, lon, time). Mirrors
+    `js/sun-uvdata.js solarZenithAngle` byte-for-byte (same NOAA
+    simplified algorithm, same fractional-year noon-centred basis,
+    same coefficient table). Lockstep is enforced by tests on both
+    sides."""
     import datetime as _dt
+
     d = _dt.datetime.fromtimestamp(when_epoch, tz=_dt.UTC)
-    # Day of year (1-365) + fractional UT hours
-    n = d.timetuple().tm_yday + (d.hour + d.minute / 60.0 + d.second / 3600.0) / 24.0
-    # Solar declination (Spencer 1971 truncated)
-    g = 2 * math.pi * (n - 1) / 365.0
-    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g)
-            - 0.006758 * math.cos(2 * g) + 0.000907 * math.sin(2 * g)
-            - 0.002697 * math.cos(3 * g) + 0.001480 * math.sin(3 * g))
+    # Day of year (1-365) — JS uses Math.floor((date - new Date(Date.UTC(year, 0, 0))) / 86400000)
+    # which is `tm_yday` (Jan 1 → 1) since Date.UTC(year, 0, 0) is Dec 31 prev.
+    day_of_year = d.timetuple().tm_yday
+    # Fractional year — noon-centred fractional hours (matches JS exactly).
+    # JS: (dayOfYear - 1 + (utcHours - 12) / 24) — uses ONLY the integer
+    # hour, not minute/second sub-hour. Mimic that to stay in lockstep.
+    fractional_year = (2 * math.pi / 365) * (day_of_year - 1 + (d.hour - 12) / 24.0)
+    # Solar declination
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(fractional_year)
+        + 0.070257 * math.sin(fractional_year)
+        - 0.006758 * math.cos(2 * fractional_year)
+        + 0.000907 * math.sin(2 * fractional_year)
+        - 0.002697 * math.cos(3 * fractional_year)
+        + 0.001480 * math.sin(3 * fractional_year)
+    )
     # Equation of time (minutes)
-    eot = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
-                    - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
-    # True solar time (minutes from local solar midnight)
-    ut_minutes = d.hour * 60 + d.minute + d.second / 60.0
-    tst = ut_minutes + eot + 4 * lon
-    hour_angle_deg = (tst / 4.0) - 180.0
-    h = math.radians(hour_angle_deg)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(fractional_year)
+        - 0.032077 * math.sin(fractional_year)
+        - 0.014615 * math.cos(2 * fractional_year)
+        - 0.040849 * math.sin(2 * fractional_year)
+    )
+    # True solar time (minutes)
+    utc_minutes = d.hour * 60 + d.minute + d.second / 60.0
+    tst = utc_minutes + eqtime + 4 * lon
+    ha = math.radians(tst / 4.0 - 180.0)
     lat_rad = math.radians(lat)
-    cos_zenith = (math.sin(lat_rad) * math.sin(decl)
-                  + math.cos(lat_rad) * math.cos(decl) * math.cos(h))
+    cos_zenith = math.sin(lat_rad) * math.sin(decl) + math.cos(lat_rad) * math.cos(decl) * math.cos(
+        ha
+    )
     cos_zenith = max(-1.0, min(1.0, cos_zenith))
     return math.degrees(math.acos(cos_zenith))

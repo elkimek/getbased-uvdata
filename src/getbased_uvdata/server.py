@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -60,15 +61,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="getbased-uvdata", version=__version__, lifespan=lifespan)
 
-# CORS — locked to the production app + localhost:8000 dev. Self-hosters
-# who run the app on a custom domain set ALLOWED_ORIGINS env (comma-
-# separated) to add their own.
+# CORS — locked to the production app domain. Local dev (e.g. the
+# Lab Charts dev server on localhost:8000) needs ALLOWED_ORIGINS set
+# explicitly to add its origin; we don't bake it into the default
+# because every public deploy then accepts CORS-credentialed XHR from
+# any local app on the user's machine, which is a credential-replay
+# surface when the bearer is shared with self-hosters.
 _DEFAULT_ORIGINS = [
     "https://app.getbased.health",
     "https://getbased.health",
-    "http://localhost:8000",
 ]
-_extra = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+# Validate operator-supplied origins so a typo doesn't silently produce
+# an "any" semantic match. Each must be a fully-qualified scheme://host
+# (port optional). Invalid entries logged + dropped.
+_ORIGIN_RE = re.compile(r"^https?://[a-z0-9.-]+(:\d+)?$")
+_extra: list[str] = []
+for raw in os.environ.get("ALLOWED_ORIGINS", "").split(","):
+    o = raw.strip().lower()
+    if not o:
+        continue
+    if not _ORIGIN_RE.match(o):
+        logging.getLogger(__name__).warning(
+            "Dropping invalid ALLOWED_ORIGINS entry: %r (must be scheme://host[:port])", raw
+        )
+        continue
+    _extra.append(o)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_DEFAULT_ORIGINS + _extra,
@@ -83,6 +100,9 @@ def _get_cache(request: Request) -> CamsCache:
 
 @app.get("/healthz")
 async def healthz(request: Request) -> dict:
+    """Liveness probe — minimal information leak. Detailed pull state
+    (last_error, lifetime counters) lives behind the bearer on /metrics
+    so unauthenticated callers can't side-channel CDS state."""
     cache: CamsCache = request.app.state.cams
     snap = cache.snapshot
     return {
@@ -94,7 +114,6 @@ async def healthz(request: Request) -> dict:
             "valid_from": snap.valid_from if snap else None,
             "valid_to": snap.valid_to if snap else None,
             "stale": cache.is_stale,
-            "last_error": cache.last_error,
         },
     }
 
@@ -170,19 +189,18 @@ async def uv(
         if peak is not None:
             daily["uv_index_max_cams"] = [round(peak, 2)]
             if peak_at is not None:
-                daily["uv_index_max_cams_at"] = [
-                    _dt_to_iso(peak_at)
-                ]
+                daily["uv_index_max_cams_at"] = [_dt_to_iso(peak_at)]
     except Exception as e:  # noqa: BLE001 — daily peak is bonus; never break /uv
         logger.warning("Daily peak UVI computation failed: %s", e)
     # Stale-grid header — monitors / browser can detect silent
     # staleness without parsing _camsMeta. Body still serves so the
     # session can complete; the browser's own freshness UI flags it.
+    # NOTE: we deliberately don't expose `last_error` here — it's a
+    # cross-origin info leak (CDS state, internal exception types).
+    # /metrics carries it for authenticated scrapers.
     headers = {}
     if cache.is_stale:
         headers["X-Cams-Stale"] = "1"
-    if cache.last_error:
-        headers["X-Cams-Last-Error"] = cache.last_error[:200].replace("\n", " ")
     _metrics["uv_requests_2xx"] += 1
     _metrics["uv_request_duration_sum_sec"] += _time.monotonic() - started
     return JSONResponse(content=body, headers=headers)
@@ -254,9 +272,14 @@ async def spectrum(
 @app.get("/metrics")
 async def metrics(request: Request) -> Response:
     """Prometheus-compatible plain-text exposition format. Includes the
-    rolling counters above plus snapshot freshness so a scrape detects
-    silent CAMS-pull failure or grid drift without needing a special
-    monitoring agent. No bearer required — same posture as /healthz."""
+    rolling counters plus snapshot freshness + last-error string so a
+    scrape detects silent CAMS-pull failure or grid drift.
+
+    Bearer-gated — exposes lifetime counters + redacted error strings
+    that, while not credentials themselves, are useful enough for
+    fingerprinting and timing-attack baselining that we keep them off
+    the unauthenticated surface. /healthz remains open for liveness."""
+    check_bearer(request)
     cache: CamsCache = request.app.state.cams
     snap = cache.snapshot
     lines: list[str] = []
@@ -283,6 +306,13 @@ async def metrics(request: Request) -> Response:
     lines.append(f"getbased_uvdata_pull_successes_total {getattr(cache, 'pull_successes', 0)}")
     lines.append("# TYPE getbased_uvdata_pull_failures_total counter")
     lines.append(f"getbased_uvdata_pull_failures_total {getattr(cache, 'pull_failures', 0)}")
+    # Surface last error as a 0-value gauge with a label so Prometheus
+    # rules can alert on transitions. Redacted in cams.py before it
+    # reaches us, but quote-escape defensively.
+    if cache.last_error:
+        sanitized = cache.last_error.replace("\\", "\\\\").replace('"', '\\"')[:200]
+        lines.append("# TYPE getbased_uvdata_last_error gauge")
+        lines.append(f'getbased_uvdata_last_error{{message="{sanitized}"}} 1')
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
@@ -324,21 +354,30 @@ def _daily_peak_uvi(
 
 def _dt_to_iso(epoch: float) -> str:
     import datetime as dt
+
     return dt.datetime.fromtimestamp(epoch, tz=dt.UTC).strftime("%Y-%m-%dT%H:%M")
 
 
 def _now_iso_utc() -> str:
     import datetime as dt
+
     return dt.datetime.now(dt.UTC).replace(microsecond=0, tzinfo=None).isoformat() + "Z"
 
 
 def _iso_to_epoch(iso: str) -> float:
+    """Parse ISO-8601 → epoch seconds. Caller is expected to have
+    routed unparsable values to a 400 — silent fallback to "now"
+    hides bugs and skews metrics counters."""
     import datetime as dt
+
     s = iso.replace("Z", "+00:00")
     try:
         d = dt.datetime.fromisoformat(s)
-    except ValueError:
-        d = dt.datetime.now(dt.UTC)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ISO-8601 time {iso!r}: {e}",
+        ) from e
     if d.tzinfo is None:
         d = d.replace(tzinfo=dt.UTC)
     return d.timestamp()
@@ -353,56 +392,80 @@ def main() -> None:
     problem so it's useful in CI / pre-flight scripts.
     """
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         sys.exit(_doctor())
     import uvicorn
+
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8324"))
     uvicorn.run("getbased_uvdata.server:app", host=host, port=port, log_level="info")
 
 
 def _doctor() -> int:
-    """One-shot env + CAMS connectivity check. Returns shell exit code."""
+    """One-shot env + CAMS connectivity check. Returns shell exit code:
+        0 — all checks pass
+        1 — environment / config problem (no CDS call attempted)
+        2 — CDS pull failed (auth, license, network, etc.)
+
+    ASCII glyphs only — Windows cmd.exe / piped logs / `LC_ALL=C` CI
+    runners all break on Unicode check marks; pure ASCII renders
+    correctly everywhere.
+    """
+    import sys
+
     print(f"getbased-uvdata doctor v{__version__}")
     print("=" * 60)
     ok = True
 
-    # Env presence checks — fail fast if the operator forgot to source .env.
     cams_key = os.environ.get("CAMS_API_KEY", "").strip()
     if not cams_key:
-        print("✗ CAMS_API_KEY not set (register at https://ads.atmosphere.copernicus.eu and put your key in .env)")
+        print(
+            "[FAIL] CAMS_API_KEY not set (register at https://ads.atmosphere.copernicus.eu and put your key in .env)"
+        )
         ok = False
     else:
-        masked = cams_key[:6] + "…" + cams_key[-4:] if len(cams_key) > 12 else "(short)"
-        print(f"✓ CAMS_API_KEY set [{masked}]")
+        # Don't print key prefix/suffix — combined with length it's a
+        # fingerprint. Just confirm presence.
+        print("[ OK ] CAMS_API_KEY set")
 
     bearer = os.environ.get("GETBASED_UVDATA_BEARER", "").strip()
     if not bearer:
-        print("⚠ GETBASED_UVDATA_BEARER unset — server will run in OPEN mode (anyone reaching the port can query CAMS).")
+        print("[WARN] GETBASED_UVDATA_BEARER unset -- server will run in OPEN mode")
+        print("       (anyone reaching the port can burn your CAMS quota)")
     else:
-        print(f"✓ GETBASED_UVDATA_BEARER set [{len(bearer)} chars]")
+        print("[ OK ] GETBASED_UVDATA_BEARER set")
 
     bbox = os.environ.get("CAMS_BBOX", "90,-180,-90,180")
-    print(f"✓ CAMS_BBOX={bbox}")
+    print(f"[ OK ] CAMS_BBOX={bbox}")
 
     if not ok:
-        print("\nFix the ✗ items above before running the server.")
+        print("\nFix the [FAIL] items above before running the server.", file=sys.stderr)
         return 1
 
-    # Live pull — this is the slow part; surface progress so the user
-    # knows the doctor isn't hung.
-    print("\nAttempting a live CAMS pull (30 s – 5 min depending on CDS queue)…")
+    print("\nAttempting a live CAMS pull (30 s - 5 min depending on CDS queue)...")
     try:
         from .cams import _pull_cams_blocking  # type: ignore
+
         snap = _pull_cams_blocking()
     except Exception as e:  # noqa: BLE001
-        print(f"✗ CAMS pull failed: {type(e).__name__}: {e}")
-        return 2
-    print(f"✓ CAMS pull OK — {len(snap.times)} hourly steps, {len(snap.lats)} lats, {len(snap.lons)} lons")
+        # Sanitize: the exception body can include the API key.
+        from .cams import _redact_secrets
 
-    # Sample lookup at a fixed point.
-    sample = snap.lookup(lat=50.0, lon=14.0, when_epoch=snap.times[0])
-    print(f"✓ Sample at (50N, 14E) → ozoneDU={sample['ozoneDU']:.1f}  AOD={sample['aod']:.3f}")
+        print(
+            f"[FAIL] CAMS pull failed: {type(e).__name__}: {_redact_secrets(str(e))}",
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        f"[ OK ] CAMS pull OK -- {len(snap.times)} hourly steps, "
+        f"{len(snap.lats)} lats, {len(snap.lons)} lons"
+    )
+
+    sample = snap.lookup(lat=50.0, lon=14.0, when_epoch=float(snap.times[0]))
+    print(
+        f"[ OK ] Sample at (50N, 14E) -> ozoneDU={sample['ozoneDU']:.1f}  AOD={sample['aod']:.3f}"
+    )
     print("\nAll checks passed. Run `getbased-uvdata` (no args) to start the server.")
     return 0
 
