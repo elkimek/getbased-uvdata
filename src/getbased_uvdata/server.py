@@ -75,6 +75,20 @@ async def healthz(request: Request) -> dict:
     }
 
 
+@app.get("/")
+async def root() -> dict:
+    """Friendly index — what is this server, where to look for what."""
+    return {
+        "service": "getbased-uvdata",
+        "version": __version__,
+        "docs": "https://github.com/elkimek/getbased-uvdata",
+        "endpoints": {
+            "GET /uv?latitude=&longitude=&time=": "per-coord CAMS atmosphere snapshot, Open-Meteo-shaped",
+            "GET /healthz": "liveness + grid metadata",
+        },
+    }
+
+
 @app.get("/uv")
 async def uv(
     request: Request,
@@ -101,7 +115,7 @@ async def uv(
     merge = os.environ.get("MERGE_OPENMETEO", "1") not in ("0", "false", "no", "")
     om = await fetch_openmeteo(latitude, longitude) if merge else None
 
-    return build_response(
+    body = build_response(
         lat=latitude,
         lon=longitude,
         when_iso=when_iso,
@@ -110,7 +124,18 @@ async def uv(
         cams_pulled_at=snap.pulled_at,
         snapshot_valid_from=snap.valid_from,
         snapshot_valid_to=snap.valid_to,
+        snapshot=snap,
     )
+    # Stale-grid header — monitors / browser can detect silent
+    # staleness without parsing _camsMeta. Body still serves so the
+    # session can complete; the browser's own freshness UI flags it.
+    from fastapi.responses import JSONResponse
+    headers = {}
+    if cache.is_stale:
+        headers["X-Cams-Stale"] = "1"
+    if cache.last_error:
+        headers["X-Cams-Last-Error"] = cache.last_error[:200].replace("\n", " ")
+    return JSONResponse(content=body, headers=headers)
 
 
 def _now_iso_utc() -> str:

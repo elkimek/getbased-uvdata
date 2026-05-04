@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cams import GridSnapshot
 
 
 def build_response(
@@ -28,6 +31,7 @@ def build_response(
     cams_pulled_at: float,
     snapshot_valid_from: float,
     snapshot_valid_to: float,
+    snapshot: "GridSnapshot | None" = None,
 ) -> dict[str, Any]:
     """Compose the JSON the browser sees."""
     when = _parse_iso(when_iso)
@@ -38,15 +42,24 @@ def build_response(
         out = dict(openmeteo["forecast"])
         hourly = dict(out.get("hourly", {}))
         times = hourly.get("time", [])
-        # Fill ozone_du + aod parallel to hourly.time. We only have one
-        # CAMS lookup at the requested instant, so we broadcast it to
-        # every hour in the response window — for the daily-scale
-        # variables CAMS publishes (ozoneDU, AOD) the within-day
-        # variation is small enough that this is acceptable for v0.1.
-        # Future: per-hour CAMS interpolation across the snapshot's
-        # leadtime axis.
-        ozone_arr = [cams_lookup.get("ozoneDU")] * len(times)
-        aod_arr = [cams_lookup.get("aod")] * len(times)
+        # Per-hour CAMS lookup against the snapshot, so different times
+        # in the response window get the right ozone/AOD (e.g. ozone
+        # has a real diurnal cycle of ~10-15 DU; broadcasting a single
+        # value across 24 h would muddy hours far from `when`). Fall
+        # back to the broadcast scalar when no snapshot is plumbed
+        # through (older callers, tests).
+        fc_offset_s = float(out.get("utc_offset_seconds") or 0)
+        if snapshot is not None and times:
+            ozone_arr: list[float | None] = []
+            aod_arr: list[float | None] = []
+            for t_str in times:
+                t_epoch = _open_meteo_time_to_epoch(t_str, fc_offset_s)
+                hourly_lookup = snapshot.lookup(lat, lon, t_epoch) if t_epoch is not None else cams_lookup
+                ozone_arr.append(hourly_lookup.get("ozoneDU"))
+                aod_arr.append(hourly_lookup.get("aod"))
+        else:
+            ozone_arr = [cams_lookup.get("ozoneDU")] * len(times)
+            aod_arr = [cams_lookup.get("aod")] * len(times)
         hourly["ozone_du"] = ozone_arr
         hourly["aod"] = aod_arr
         out["hourly"] = hourly
@@ -102,3 +115,20 @@ def _parse_iso(s: str | None) -> _dt.datetime:
         return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return _dt.datetime.now(_dt.UTC).replace(tzinfo=None)
+
+
+def _open_meteo_time_to_epoch(t_str: str, utc_offset_s: float) -> float | None:
+    """Open-Meteo with `timezone=auto` returns naive local-clock strings
+    like '2024-06-01T13:00'. Multiply through utc_offset_seconds to get
+    real UTC epoch — matches js/sun-uvdata.js's nearestHourIndex math
+    so hourly indices align between server and browser."""
+    if not isinstance(t_str, str):
+        return None
+    try:
+        d = _dt.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is not None:
+        return d.timestamp()
+    # Naive local-clock string; subtract utc_offset to get UTC epoch.
+    return d.replace(tzinfo=_dt.UTC).timestamp() - utc_offset_s

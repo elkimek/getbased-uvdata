@@ -92,12 +92,61 @@ class TestReshape:
             cams_lookup=cams, openmeteo=om,
             cams_pulled_at=1700000000, snapshot_valid_from=1700000000, snapshot_valid_to=1700086400,
         )
-        # CAMS ozone broadcast across every hourly entry, parallel to time[].
+        # No snapshot plumbed through → fall back to broadcasting the
+        # single CAMS lookup across every hourly entry.
         assert resp["hourly"]["ozone_du"] == [290.0, 290.0]
         assert resp["hourly"]["aod"] == [0.08, 0.08]
         # Open-Meteo fields preserved untouched.
         assert resp["hourly"]["uv_index"] == [3.0, 4.5]
         assert resp["airQuality"]["current"]["european_aqi"] == 30
+
+    def test_per_hour_interpolation_when_snapshot_supplied(self):
+        """Each hourly entry gets its own CAMS lookup against the
+        snapshot's leadtime axis — different hours of the day pick up
+        different ozone/AOD values, not a flat broadcast."""
+        import time as _time
+        import numpy as np
+
+        from getbased_uvdata.cams import GridSnapshot
+
+        # Two-hour snapshot at the same gridpoint with deliberately
+        # different ozone values so we can prove per-hour selection.
+        # Hour A = epoch 1717239600 (2024-06-01 11:00 UTC), DU 300
+        # Hour B = epoch 1717243200 (2024-06-01 12:00 UTC), DU 320
+        snap = GridSnapshot(
+            pulled_at=_time.time(),
+            valid_from=1717239600.0,
+            valid_to=1717243200.0,
+            times=np.array([1717239600.0, 1717243200.0]),
+            lats=np.array([50.0]),
+            lons=np.array([14.0]),
+            ozone_du=np.array([[[300.0]], [[320.0]]]),
+            aod_550=np.array([[[0.1]], [[0.2]]]),
+        )
+        om = {
+            "forecast": {
+                "latitude": 50.0,
+                "longitude": 14.0,
+                "utc_offset_seconds": 0,  # Open-Meteo strings already UTC
+                "hourly": {
+                    "time": ["2024-06-01T11:00", "2024-06-01T12:00"],
+                    "uv_index": [3.0, 4.5],
+                },
+            },
+        }
+        resp = build_response(
+            lat=50.0, lon=14.0, when_iso="2024-06-01T11:30Z",
+            cams_lookup={"ozoneDU": -999, "aod": -999},  # should NOT leak through
+            openmeteo=om,
+            cams_pulled_at=_time.time(), snapshot_valid_from=1717239600.0,
+            snapshot_valid_to=1717243200.0,
+            snapshot=snap,
+        )
+        # Per-hour values, not the broadcast scalar.
+        assert resp["hourly"]["ozone_du"] == [300.0, 320.0]
+        assert resp["hourly"]["aod"] == [0.1, 0.2]
+        # The cams_lookup fallback value (-999) must NOT appear.
+        assert -999 not in resp["hourly"]["ozone_du"]
 
 
 class TestServer:
