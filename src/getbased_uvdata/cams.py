@@ -158,9 +158,16 @@ def _pull_cams_blocking() -> GridSnapshot:
     # needs. We pull only the hourly steps we'll actually serve.
     leadtimes = [str(h) for h in range(0, 25)]
 
+    # CAMS publishes forecasts up to ~5 days ahead of the current real-
+    # world date. CDS rejects requests with `date` in the future. Any
+    # operator running on a clock-shifted dev box (e.g. an integration
+    # harness with a baked-in date) can override this to a known-good
+    # past date for smoke testing — `CAMS_DATE_OVERRIDE=2024-06-01`.
+    requested_date = os.environ.get("CAMS_DATE_OVERRIDE", "").strip() or _today_utc_iso()
+
     request = {
         "variable": _CAMS_VARIABLES,
-        "date": _today_utc_iso(),
+        "date": requested_date,
         "time": "00:00",  # most recent run; CDS auto-selects the published cycle
         "leadtime_hour": leadtimes,
         "type": "forecast",
@@ -169,25 +176,33 @@ def _pull_cams_blocking() -> GridSnapshot:
     }
 
     with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "cams.zip"
+        out = Path(td) / "cams.bin"
         client.retrieve(_CAMS_DATASET, request, str(out))
-        # netcdf_zip → unpack. In v0.1 we accept either the zip or the
-        # raw .nc, since CDS sometimes returns one or the other depending
-        # on dataset config. xarray handles both via h5netcdf engine.
-        ds = xr.open_dataset(out, decode_times=True)
+        # CDS may return a raw .nc OR a zip wrapping one or more .nc
+        # files (depends on dataset config + format param). Detect the
+        # magic bytes and extract before xarray tries to open. Without
+        # this, an `xr.open_dataset(zip)` call fails with the unhelpful
+        # "did not find a match in any of xarray's currently installed
+        # IO backends" error.
+        nc_path = _materialize_netcdf(out, td)
+        ds = xr.open_dataset(nc_path, decode_times=True, engine="netcdf4")
         # Variable rename: CDS short names are stable but verbose; map to
         # our internal keys here so the rest of the code stays clean.
         var_map = {
-            "tco3": "ozone_du",            # total column ozone (kg/m² → DU below)
-            "go3": "ozone_du",             # alternate name for the same field
+            "gtco3": "ozone_du",           # current CAMS short name (since 2023)
+            "tco3": "ozone_du",             # legacy short name
+            "go3": "ozone_du",             # alternate name some products use
             "aod550": "aod_550",
+            "aod_550": "aod_550",          # already-correct passthrough
             "t550aer": "aod_550",
+            "tau_550": "aod_550",          # forecast-product variant
         }
         renamed = {}
         for cds_name, our_name in var_map.items():
-            if cds_name in ds:
+            if cds_name in ds and cds_name != our_name:
                 renamed[cds_name] = our_name
-        ds = ds.rename(renamed)
+        if renamed:
+            ds = ds.rename(renamed)
 
         if "ozone_du" not in ds or "aod_550" not in ds:
             raise RuntimeError(
@@ -197,20 +212,36 @@ def _pull_cams_blocking() -> GridSnapshot:
         # CAMS units are kg/m² for total column ozone — convert to DU.
         # 1 DU = 2.1414e-5 kg/m² (NIST). So DU = ozone_kgm2 / 2.1414e-5.
         # If CAMS already returned DU (depends on dataset config) skip.
-        ozone = ds["ozone_du"].values  # may be (T, LAT, LON) or (T, lev, LAT, LON)
-        if ozone.ndim == 4:
-            # Total column comes back as a single-level array; squeeze.
-            ozone = np.squeeze(ozone, axis=1)
+        # Squeeze ALL singleton dims (forecast/reference axes that drop
+        # in when `time:'00:00'` is specified once); leaves us with
+        # (T, LAT, LON) regardless of how many wrap dimensions CDS chose
+        # to add. Without this an arbitrary singleton axis breaks the
+        # (T, LAT, LON) assumption downstream.
+        ozone = np.squeeze(ds["ozone_du"].values)
+        if ozone.ndim != 3:
+            raise RuntimeError(
+                f"CAMS ozone_du array has unexpected shape {ozone.shape} after squeeze; expected (T, LAT, LON)"
+            )
         units = ds["ozone_du"].attrs.get("units", "").lower()
         if "kg" in units:
             ozone = ozone / 2.1414e-5
 
-        aod = ds["aod_550"].values
-        if aod.ndim == 4:
-            aod = np.squeeze(aod, axis=1)
+        aod = np.squeeze(ds["aod_550"].values)
+        if aod.ndim != 3:
+            raise RuntimeError(
+                f"CAMS aod_550 array has unexpected shape {aod.shape} after squeeze; expected (T, LAT, LON)"
+            )
 
-        # Time axis: convert numpy datetime64[ns] → epoch seconds.
-        times = (ds["time"].values.astype("datetime64[s]")
+        # Time axis: CAMS uses CDS-MAGICS conventions — `valid_time` is
+        # the per-step timestamp we want (= forecast_reference_time +
+        # forecast_period). When a request fixes `time: 00:00` and asks
+        # for N leadtimes, `valid_time` arrives shaped (1, N) instead of
+        # (N,). Flatten to a 1-D array so downstream code can index with
+        # `times[i]` without runtime shape surprises. Also collapse the
+        # corresponding lead dimension on the data variables below.
+        time_var = "valid_time" if "valid_time" in ds else "time"
+        raw_times = ds[time_var].values
+        times = (np.asarray(raw_times).reshape(-1).astype("datetime64[s]")
                                   .astype(np.int64).astype(float))
         lats = ds["latitude"].values.astype(float)
         lons = ds["longitude"].values.astype(float)
@@ -237,6 +268,45 @@ def _today_utc_iso() -> str:
     """UTC date string for the CDS request 'date' field."""
     import datetime as dt
     return dt.datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
+    """Return a path to a usable .nc file, unzipping if CDS gave us a zip.
+
+    Magic bytes:
+      • zip   → 50 4b 03 04
+      • HDF5  → 89 48 44 46 (modern netCDF-4)
+      • CDF   → 43 44 46 01 / 43 44 46 02 (classic netCDF-3)
+    """
+    import zipfile
+
+    head = downloaded.read_bytes()[:4]
+    if head[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(downloaded) as zf:
+            nc_members = [n for n in zf.namelist() if n.lower().endswith(".nc")]
+            if not nc_members:
+                raise RuntimeError(
+                    f"CAMS zip contains no .nc file. Members: {zf.namelist()}"
+                )
+            # CDS occasionally splits per-variable into separate .nc files.
+            # Prefer the largest one (the merged forecast); the small ones
+            # are typically per-step companions we don't need.
+            target = max(
+                nc_members,
+                key=lambda n: zf.getinfo(n).file_size,
+            )
+            zf.extract(target, work_dir)
+            return Path(work_dir) / target
+    if head[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02"):
+        return downloaded
+    # Anything else: peek at the first few bytes to surface a useful
+    # error. If CDS returned an HTML/JSON error page, we want the
+    # message visible in the logs rather than xarray's generic
+    # "no IO backend" failure.
+    raise RuntimeError(
+        f"Downloaded CAMS file is not a netCDF or zip. First bytes: {head!r}. "
+        f"Full content (truncated): {downloaded.read_bytes()[:512]!r}"
+    )
 
 
 async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
