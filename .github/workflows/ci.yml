@@ -48,7 +48,7 @@ jobs:
       # Build only — we don't push from CI. Smoke-tests the Dockerfile
       # so a broken multi-stage definition fails fast.
       - name: Build image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
