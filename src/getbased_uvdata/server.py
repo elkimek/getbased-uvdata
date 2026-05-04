@@ -190,6 +190,15 @@ async def metrics(request: Request) -> "Response":
         lines.append(f"getbased_uvdata_snapshot_timesteps {len(snap.times)}")
     lines.append(f"# TYPE getbased_uvdata_snapshot_stale gauge")
     lines.append(f"getbased_uvdata_snapshot_stale {1 if cache.is_stale else 0}")
+    # Lifetime pull counters — useful to alert on sustained failure.
+    # is_stale only flips after 24 h; this surfaces problems within
+    # one retry cycle (~minutes).
+    lines.append(f"# TYPE getbased_uvdata_pull_attempts_total counter")
+    lines.append(f"getbased_uvdata_pull_attempts_total {getattr(cache, 'pull_attempts', 0)}")
+    lines.append(f"# TYPE getbased_uvdata_pull_successes_total counter")
+    lines.append(f"getbased_uvdata_pull_successes_total {getattr(cache, 'pull_successes', 0)}")
+    lines.append(f"# TYPE getbased_uvdata_pull_failures_total counter")
+    lines.append(f"getbased_uvdata_pull_failures_total {getattr(cache, 'pull_failures', 0)}")
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 

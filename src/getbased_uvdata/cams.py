@@ -163,6 +163,12 @@ class CamsCache:
         self._lock = asyncio.Lock()
         self._last_error: str | None = None
         self._last_pull_attempt: float = 0.0
+        # Lifetime counters surfaced on /metrics so monitors can alert
+        # on sustained failure (the boolean is_stale only flips after
+        # 24h; the counter triggers immediately).
+        self.pull_attempts: int = 0
+        self.pull_successes: int = 0
+        self.pull_failures: int = 0
         self._cache_dir = cache_dir
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
@@ -187,10 +193,12 @@ class CamsCache:
     async def refresh(self) -> bool:
         async with self._lock:
             self._last_pull_attempt = time.time()
+            self.pull_attempts += 1
             try:
                 snap = await asyncio.to_thread(_pull_cams_blocking)
                 self._snapshot = snap
                 self._last_error = None
+                self.pull_successes += 1
                 logger.info("CAMS pull OK: %s timesteps, %s lats, %s lons",
                             len(snap.times), len(snap.lats), len(snap.lons))
                 if self._cache_dir:
@@ -201,6 +209,7 @@ class CamsCache:
                 return True
             except Exception as e:  # noqa: BLE001 — we WANT to keep serving stale on failure
                 self._last_error = f"{type(e).__name__}: {e}"
+                self.pull_failures += 1
                 logger.exception("CAMS pull failed")
                 return False
 
@@ -437,11 +446,33 @@ def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
 
 
 async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
-    """Refresh `cache` every `interval_sec` seconds, forever."""
+    """Refresh `cache` every `interval_sec` seconds, with exponential
+    backoff retries on failure so a transient CDS hiccup doesn't leave
+    the grid stale for the full 6-hour interval.
+
+    Backoff: 60 s → 120 s → 240 s → 480 s → 960 s → 1800 s (cap).
+    Resets to 60 s after a successful pull. Capped to never exceed the
+    nominal interval so the schedule still moves forward.
+    """
+    INITIAL_BACKOFF_SEC = 60
+    MAX_BACKOFF_SEC = min(1800, interval_sec)
+
     # Initial pull on boot — server should serve real data ASAP. Failure
-    # is logged but doesn't kill the process; reads return 503 until a
+    # is logged but doesn't kill the process; reads return 503 (or serve
+    # the persisted snapshot if one was loaded from disk) until a
     # successful pull lands.
-    await cache.refresh()
+    backoff = INITIAL_BACKOFF_SEC
     while True:
-        await asyncio.sleep(interval_sec)
-        await cache.refresh()
+        ok = await cache.refresh()
+        if ok:
+            await asyncio.sleep(interval_sec)
+            backoff = INITIAL_BACKOFF_SEC
+            continue
+        # Failure path: short retry sleep with exponential backoff,
+        # capped so we never block longer than the nominal interval.
+        logger.warning(
+            "CAMS pull failed; retrying in %d s (next backoff: %d s)",
+            backoff, min(backoff * 2, MAX_BACKOFF_SEC),
+        )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, MAX_BACKOFF_SEC)

@@ -118,6 +118,71 @@ class TestSnapshotPersistence:
         assert cache.snapshot is None
 
 
+class TestRetryBackoff:
+    @pytest.mark.asyncio
+    async def test_backoff_retries_on_failure_then_recovers(self, monkeypatch):
+        """`background_pull_loop` should retry quickly after a failed
+        pull (not wait the full interval), then return to the nominal
+        cadence once a refresh succeeds. Validates the failure-counter
+        as a side effect."""
+        import asyncio as _asyncio
+        from getbased_uvdata import cams as cams_mod
+
+        # Sequence: fail, fail, succeed, then loop forever sleeping.
+        results = [False, False, True]
+
+        class FakeCache:
+            pull_attempts = 0
+            pull_failures = 0
+            pull_successes = 0
+
+            async def refresh(self) -> bool:
+                self.pull_attempts += 1
+                if not results:
+                    return True
+                ok = results.pop(0)
+                if ok:
+                    self.pull_successes += 1
+                else:
+                    self.pull_failures += 1
+                return ok
+
+        cache = FakeCache()
+        # Replace asyncio.sleep so the test doesn't actually wait minutes.
+        # Capture the REAL sleep before patching so our fake can yield
+        # to the event loop without infinite recursion.
+        real_sleep = _asyncio.sleep
+        sleeps: list[float] = []
+
+        async def _instant_sleep(s):
+            sleeps.append(s)
+            await real_sleep(0)
+
+        monkeypatch.setattr(cams_mod.asyncio, "sleep", _instant_sleep)
+        # Run the loop briefly, then cancel.
+        task = _asyncio.create_task(cams_mod.background_pull_loop(cache, interval_sec=600))
+        # Give the task time to step through 3 refresh calls. Each call
+        # awaits exactly one sleep, so 3 attempts → 3 entries in `sleeps`.
+        for _ in range(20):
+            await _asyncio.sleep(0)
+            if cache.pull_attempts >= 3 and len(sleeps) >= 3:
+                break
+        task.cancel()
+        try:
+            await task
+        except _asyncio.CancelledError:
+            pass
+
+        assert cache.pull_attempts >= 3
+        assert cache.pull_failures == 2
+        assert cache.pull_successes == 1
+        # Filter out 0-second sleeps (our test harness's yield), keep
+        # the actual backoff durations the loop emitted.
+        backoff_sleeps = [s for s in sleeps if s > 0]
+        # First fail → 60s sleep; second fail → 120s; third (success) → interval_sec=600.
+        assert backoff_sleeps[:3] == [60, 120, 600], f"got {backoff_sleeps[:3]}"
+
+
 class TestReshape:
     def test_cams_only_envelope_is_open_meteo_shaped(self):
         cams = {"ozoneDU": 305.0, "aod": 0.12}
