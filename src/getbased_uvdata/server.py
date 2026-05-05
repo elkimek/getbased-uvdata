@@ -449,7 +449,12 @@ def _doctor() -> int:
     try:
         from .cams import _pull_cams_blocking  # type: ignore
 
-        snap = _pull_cams_blocking()
+        # Pass CAMS_CACHE_DIR so the staging dir lands on the persistent
+        # volume — same path as the production CamsCache.refresh code.
+        # Empty/unset env → cache_dir=None → /tmp fallback (acceptable
+        # for the doctor command, which is a one-shot operator probe).
+        smoke_cache_dir = os.environ.get("CAMS_CACHE_DIR", "").strip() or None
+        snap = _pull_cams_blocking(smoke_cache_dir)
     except Exception as e:  # noqa: BLE001
         # Sanitize: the exception body can include the API key.
         from .cams import _redact_secrets
