@@ -26,12 +26,18 @@ services:
       - "127.0.0.1:8324:8324"
     volumes:
       - cams-cache:/data
-    # Memory cap — hard ceiling on the container's RSS so an xarray
-    # parse spike or a runaway grid can never starve other services
-    # on the same host (evolu-relay / context-gateway co-tenancy).
-    # Steady state is ~150-200 MB; 512m gives 2-3x headroom for the
-    # 6-hourly CAMS-pull transient.
-    mem_limit: 512m
+    # Memory cap — hard ceiling on the container's RSS so a pull
+    # spike can never starve other services on the same host (evolu-
+    # relay / context-gateway co-tenancy). Steady state stays around
+    # 150-250 MB; the transient peak hits during the CAMS pull when
+    # the 234 MB zip is decoded by xarray with all four AQ variables
+    # in flight (peaks observed at ~900 MB-1.1 GB on the global grid).
+    # Earlier 512m cap was sized for the single-variable snapshot
+    # before PM2.5/PM10/AQ added; OOM-killed every pull mid-decode
+    # (auto-restart cleaned up the staging dir via the v0.1.1 sweep,
+    # but the snapshot never landed). 1500m leaves comfortable
+    # headroom on a 2 GB VPS while still capping a runaway.
+    mem_limit: 1500m
     logging:
       driver: json-file
       options:

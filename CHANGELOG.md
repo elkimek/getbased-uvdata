@@ -4,6 +4,12 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-05
+
+### Fixed
+
+- **Container `mem_limit` raised 512m → 1500m.** The 512m cap was sized for the single-variable (ozone-only) snapshot from before PM2.5 / PM10 / total AOD got added. With all four AQ variables in flight, the CAMS pull peaks at ~900 MB-1.1 GB during xarray decode of the 234 MB zip, OOM-killing every pull mid-decode. The container would auto-restart, the v0.1.1 startup sweep would correctly clean up the orphan staging dir, but the actual snapshot never landed — so on-disk data drifted further past the 24h `is_stale` line over the v0.1.0 → v0.1.2 window. Bumped to 1500m, which leaves comfortable headroom on the 2 GB production VPS while still capping a runaway parse.
+
 ## [0.1.2] — 2026-05-05
 
 ### Fixed
