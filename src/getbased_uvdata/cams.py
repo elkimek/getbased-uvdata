@@ -747,6 +747,16 @@ def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
                 key=lambda n: zf.getinfo(n).file_size,
             )
             zf.extract(target, work_dir)
+            # Drop the zip the moment its contents are extracted. Holding
+            # zip + extracted netCDF + old snapshot simultaneously is what
+            # blew the host disk past the 20 GB cap twice in 24 h
+            # (May 4 20:20 + May 5 04:30 UTC) — peak transient was ~840 MB.
+            # Deleting the zip drops it to ~534 MB. The extracted file in
+            # work_dir is what the rest of the pipeline reads from.
+            try:
+                downloaded.unlink()
+            except OSError:
+                logger.warning("Failed to delete extracted zip %s", downloaded)
             return Path(work_dir) / target
     if head[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02"):
         return downloaded
@@ -772,12 +782,27 @@ async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
     INITIAL_BACKOFF_SEC = 60
     MAX_BACKOFF_SEC = min(1800, interval_sec)
 
+    # Periodic stage sweep — clean up orphan cams-stage-* dirs left by
+    # crashed refreshes WITHOUT waiting for a container restart. Without
+    # this, an OOM/SIGKILL during extract leaves ~534 MB orphan that
+    # accumulates with every subsequent refresh attempt until the next
+    # container restart finally sweeps them. Cheap (one listdir per
+    # interval) and runs before each refresh so the host has maximum
+    # headroom for the next transient peak.
+    def _sweep_now() -> None:
+        if cache._cache_dir:
+            try:
+                _sweep_stale_staging(cache._cache_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Periodic stage sweep failed: %s", e)
+
     # Initial pull on boot — server should serve real data ASAP. Failure
     # is logged but doesn't kill the process; reads return 503 (or serve
     # the persisted snapshot if one was loaded from disk) until a
     # successful pull lands.
     backoff = INITIAL_BACKOFF_SEC
     while True:
+        _sweep_now()
         ok = await cache.refresh()
         if ok:
             await asyncio.sleep(interval_sec)
