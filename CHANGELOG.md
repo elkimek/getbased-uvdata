@@ -4,6 +4,12 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-05
+
+### Fixed
+
+- **Default request date is now `today_utc - 1`, not `today_utc`.** CAMS Atmospheric Composition Forecasts publishes the daily 00:00 UTC cycle 6–12h after midnight; ADS rejects requests carrying today's date during that window with a generic `400 invalid combination of values`. The actual reason (`date` out of the enum's valid range) only surfaces via the `/constraints` endpoint, which we now know to consult during incident triage. Anchoring the default one day back keeps us inside the published window regardless of where in the publication cycle we hit. Yesterday's forecast still gives 4–5 days of forward coverage. Operators backfilling can still override via `CAMS_DATE_OVERRIDE=YYYY-MM-DD`. Closes the same `CAMS pull failed` symptom that v0.1.1's `data_format` rename did NOT fix — the request shape was a red herring; the date was the real blocker.
+
 ## [0.1.1] — 2026-05-05
 
 ### Fixed

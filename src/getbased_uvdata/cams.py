@@ -482,12 +482,19 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
     leadtimes_set.update(range(27, horizon_hours + 1, 3))
     leadtimes = [str(h) for h in sorted(leadtimes_set)]
 
-    # CAMS publishes forecasts up to ~5 days ahead of the current real-
-    # world date. CDS rejects requests with `date` in the future. Any
-    # operator running on a clock-shifted dev box (e.g. an integration
-    # harness with a baked-in date) can override this to a known-good
-    # past date for smoke testing — `CAMS_DATE_OVERRIDE=2024-06-01`.
-    requested_date = os.environ.get("CAMS_DATE_OVERRIDE", "").strip() or _today_utc_iso()
+    # CAMS publishes forecasts up to ~5 days ahead of the current
+    # real-world date, but the daily 00:00 UTC cycle isn't ready
+    # immediately — there's a ~6-12h publication lag, during which
+    # ADS rejects requests carrying TODAY's date with a generic
+    # `400 invalid combination of values` (the actual reason — date
+    # out of valid range — is hidden in the schema's `date` enum
+    # under the constraints endpoint). Default to (UTC today - 1 day)
+    # so we always sit safely inside the published window. Yesterday's
+    # forecast still gives 4-5 days of forward coverage which is
+    # enough for everything the consumer renders. Operators can
+    # override with `CAMS_DATE_OVERRIDE=YYYY-MM-DD` for backfills
+    # or smoke testing against a specific known-good past date.
+    requested_date = os.environ.get("CAMS_DATE_OVERRIDE", "").strip() or _yesterday_utc_iso()
 
     # Keys match the new ADS portal contract directly. The legacy
     # cdsapi `format` key passes through `ecmwf-datastores-client`'s
@@ -699,6 +706,21 @@ def _today_utc_iso() -> str:
     import datetime as dt
 
     return dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+
+
+def _yesterday_utc_iso() -> str:
+    """UTC `today - 1 day`, our default CAMS request date.
+
+    The CAMS forecast for "today" isn't usually published until 6-12h
+    after 00:00 UTC; ADS rejects a same-day request with a generic
+    `invalid combination of values` (the real reason — date out of
+    enum — only surfaces via the `/constraints` endpoint). Anchoring
+    the default one day back keeps us inside the published window
+    regardless of where in the publication cycle we hit.
+    """
+    import datetime as dt
+
+    return (dt.datetime.now(dt.UTC) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _materialize_netcdf(downloaded: Path, work_dir: str) -> Path:
