@@ -162,6 +162,39 @@ class TestSnapshotPersistence:
         assert abs(out["o3Surface"] - 67.5) < 1e-9
 
 
+class TestStaleStagingSweep:
+    """Regression: a SIGKILL-during-retrieve used to leak `tmpXXXX`
+    dirs (~470 MB each) under `/tmp` inside the container's writable
+    layer. In production this filled the host disk to 100% and wedged
+    the colocated evolu-relay's SQLite (`SQLITE_FULL`). The fix moves
+    staging into the persistent cache_dir AND sweeps orphans on
+    startup, so post-crash recovery is automatic."""
+
+    def test_orphan_staging_dirs_cleaned_at_startup(self, tmp_path):
+        """A stale `cams-stage-*` dir from a prior run is removed
+        when a fresh CamsCache is constructed."""
+        stale = tmp_path / "cams-stage-leftover"
+        stale.mkdir()
+        (stale / "cams.bin").write_bytes(b"orphan netcdf payload")
+        assert stale.exists()
+        CamsCache(cache_dir=str(tmp_path))
+        assert not stale.exists(), "stale staging dir should be swept at init"
+
+    def test_sweep_does_not_touch_unrelated_files(self, tmp_path):
+        """Sweep is prefix-scoped — it must not delete the snapshot
+        npz, user files, or any non-prefixed entry."""
+        snapshot = tmp_path / CamsCache.SNAPSHOT_FILENAME
+        snapshot.write_bytes(b"important snapshot")
+        unrelated = tmp_path / "user-config.json"
+        unrelated.write_bytes(b"{}")
+        stale = tmp_path / "cams-stage-doomed"
+        stale.mkdir()
+        CamsCache(cache_dir=str(tmp_path))
+        assert snapshot.exists(), "snapshot must survive sweep"
+        assert unrelated.exists(), "unrelated files must survive sweep"
+        assert not stale.exists(), "only cams-stage-* dirs are removed"
+
+
 class TestRedaction:
     def test_redact_secrets_strips_live_values(self, monkeypatch):
         """`_redact_secrets` MUST scrub live env-var values from any

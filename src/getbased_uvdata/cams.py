@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -32,6 +33,16 @@ from pathlib import Path
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Staging dir prefix used for CDS retrieve unzip work. Stable so the
+# startup sweep can recognize our orphans without touching unrelated
+# files in the cache volume. Lives under `cache_dir` (persistent
+# volume) rather than the default `/tmp` (container writable layer) —
+# the latter caused 14 GB of orphan netCDFs to accumulate in production
+# when uvdata was SIGKILL'd mid-retrieve before TemporaryDirectory's
+# finalizer could run, eventually filling the host disk and wedging
+# the colocated evolu-relay's SQLite writes.
+_PULL_STAGING_PREFIX = "cams-stage-"
 
 # Variables we ask CAMS for. Names match the CDS-API short-name table for
 # the CAMS global atmospheric composition forecast product. Adjust if
@@ -247,6 +258,7 @@ class CamsCache:
         self._cache_dir = cache_dir
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
+            _sweep_stale_staging(cache_dir)
             self._try_load_from_disk()
 
     @property
@@ -277,7 +289,7 @@ class CamsCache:
                 # of "too slow."
                 timeout = float(os.environ.get("CAMS_PULL_TIMEOUT_SEC", "600"))
                 snap = await asyncio.wait_for(
-                    asyncio.to_thread(_pull_cams_blocking),
+                    asyncio.to_thread(_pull_cams_blocking, self._cache_dir),
                     timeout=timeout,
                 )
                 self._snapshot = snap
@@ -394,8 +406,40 @@ class CamsCache:
             logger.warning("Failed to load snapshot from %s: %s", path, e)
 
 
-def _pull_cams_blocking() -> GridSnapshot:
-    """Synchronous CAMS retrieve via the CDS-API. Run from a worker thread."""
+def _sweep_stale_staging(cache_dir: str) -> None:
+    """Remove any orphan `cams-stage-*` dirs from a previous ungraceful
+    shutdown. Safe at startup — no other process can be using them
+    because we just booted. Bounded I/O: the volume only ever holds
+    one staging dir at a time during normal operation."""
+    try:
+        entries = os.listdir(cache_dir)
+    except OSError:
+        return
+    removed = 0
+    for name in entries:
+        if not name.startswith(_PULL_STAGING_PREFIX):
+            continue
+        path = os.path.join(cache_dir, name)
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to sweep stale staging dir %s: %s", path, e)
+    if removed:
+        logger.info("Swept %d orphan staging dir(s) from %s", removed, cache_dir)
+
+
+def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
+    """Synchronous CAMS retrieve via the CDS-API. Run from a worker thread.
+
+    `cache_dir` (when set) is used as the parent for the staging
+    `TemporaryDirectory` so the unzipped netCDF lands on the persistent
+    volume instead of the container writable layer. The `with` block
+    still removes it on normal exit; the cache_dir placement only
+    matters when the worker is killed (SIGKILL/OOM) before the
+    finalizer runs — orphans then accumulate in a monitored volume
+    and are cleaned up by `_sweep_stale_staging` at next startup,
+    rather than silently bloating the container's overlay."""
     import cdsapi  # heavy import deferred to first pull
     import xarray as xr
 
@@ -457,7 +501,7 @@ def _pull_cams_blocking() -> GridSnapshot:
         "area": [north, west, south, east],
     }
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(prefix=_PULL_STAGING_PREFIX, dir=cache_dir) as td:
         out = Path(td) / "cams.bin"
         client.retrieve(_CAMS_DATASET, request, str(out))
         # CDS may return a raw .nc OR a zip wrapping one or more .nc
