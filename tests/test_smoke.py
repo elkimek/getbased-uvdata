@@ -210,9 +210,9 @@ class TestStaleStagingSweep:
         monkeypatch.setattr(cams_mod.shutil, "rmtree", boom)
         with caplog.at_level("WARNING", logger="getbased_uvdata.cams"):
             cams_mod._sweep_stale_staging(str(tmp_path))
-        assert any(
-            "Failed to sweep stale staging dir" in rec.message for rec in caplog.records
-        ), "rmtree failure must produce a warning log line"
+        assert any("Failed to sweep stale staging dir" in rec.message for rec in caplog.records), (
+            "rmtree failure must produce a warning log line"
+        )
 
 
 class TestRedaction:
