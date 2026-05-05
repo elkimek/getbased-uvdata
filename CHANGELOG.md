@@ -4,6 +4,10 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- **CAMS pull was failing with HTTP 400 against the new ADS portal.** The legacy `format: 'netcdf_zip'` key passed through `ecmwf-datastores-client`'s compatibility shim, which silently rewrote it to `data_format: 'netcdf'` AND injected an explicit `grid: [0.4, 0.4]`. CAMS Atmospheric Composition Forecasts has a fixed native grid; an explicit grid field is rejected as `invalid combination of values`. Switched the request to use the ADS-native `data_format` key directly (and wrapped `time`/`type` as lists to match the form's emitted shape) so the shim no longer touches our payload. Atmosphere data is fresh again.
+
 ## [0.1.0] — initial public release
 
 ### Added
