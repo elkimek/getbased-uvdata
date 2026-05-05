@@ -416,17 +416,27 @@ def _sweep_stale_staging(cache_dir: str) -> None:
     except OSError:
         return
     removed = 0
+    failed = 0
     for name in entries:
         if not name.startswith(_PULL_STAGING_PREFIX):
             continue
         path = os.path.join(cache_dir, name)
+        # No ignore_errors=True — we want exceptions to surface so the
+        # except below can log them AND so removed only counts actual
+        # successes (else "Swept N" lies when rmtree silently failed).
         try:
-            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(path)
             removed += 1
-        except Exception as e:  # noqa: BLE001
+        except OSError as e:
+            failed += 1
             logger.warning("Failed to sweep stale staging dir %s: %s", path, e)
-    if removed:
-        logger.info("Swept %d orphan staging dir(s) from %s", removed, cache_dir)
+    if removed or failed:
+        logger.info(
+            "Staging sweep: %d removed, %d failed (in %s)",
+            removed,
+            failed,
+            cache_dir,
+        )
 
 
 def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:

@@ -194,6 +194,26 @@ class TestStaleStagingSweep:
         assert unrelated.exists(), "unrelated files must survive sweep"
         assert not stale.exists(), "only cams-stage-* dirs are removed"
 
+    def test_sweep_failures_are_logged_not_swallowed(self, tmp_path, caplog, monkeypatch):
+        """rmtree failures must reach the warning log AND not be
+        counted as removed — regression guard against the previous
+        `ignore_errors=True` + try/except combo that silently dropped
+        failures while incrementing the success counter."""
+        from getbased_uvdata import cams as cams_mod
+
+        stale = tmp_path / "cams-stage-locked"
+        stale.mkdir()
+
+        def boom(path):  # type: ignore[unused-argument]
+            raise OSError("simulated permission denied")
+
+        monkeypatch.setattr(cams_mod.shutil, "rmtree", boom)
+        with caplog.at_level("WARNING", logger="getbased_uvdata.cams"):
+            cams_mod._sweep_stale_staging(str(tmp_path))
+        assert any(
+            "Failed to sweep stale staging dir" in rec.message for rec in caplog.records
+        ), "rmtree failure must produce a warning log line"
+
 
 class TestRedaction:
     def test_redact_secrets_strips_live_values(self, monkeypatch):
