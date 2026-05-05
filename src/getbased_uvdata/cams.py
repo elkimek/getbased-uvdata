@@ -435,13 +435,25 @@ def _pull_cams_blocking() -> GridSnapshot:
     # past date for smoke testing — `CAMS_DATE_OVERRIDE=2024-06-01`.
     requested_date = os.environ.get("CAMS_DATE_OVERRIDE", "").strip() or _today_utc_iso()
 
+    # Keys match the new ADS portal contract directly. The legacy
+    # cdsapi `format` key passes through `ecmwf-datastores-client`'s
+    # compatibility shim, which on CAMS Atmospheric Composition
+    # Forecasts auto-rewrote `format: 'netcdf_zip'` to
+    # `data_format: 'netcdf'` AND injected `grid: [0.4, 0.4]` — the
+    # combination ADS rejected with HTTP 400 "invalid combination of
+    # values" (CAMS forecast products have a fixed native grid; an
+    # explicit `grid` field is invalid for this dataset). Using the
+    # ADS-native `data_format` key bypasses the shim. Scalar values
+    # (`time`, `type`) are wrapped in lists to match what the ADS
+    # form emits, since the shim's list-coercion path is the same
+    # one that injected `grid`.
     request = {
         "variable": _CAMS_VARIABLES,
         "date": requested_date,
-        "time": "00:00",  # most recent run; CDS auto-selects the published cycle
+        "time": ["00:00"],  # most recent run; CDS auto-selects the published cycle
         "leadtime_hour": leadtimes,
-        "type": "forecast",
-        "format": "netcdf_zip",
+        "type": ["forecast"],
+        "data_format": "netcdf_zip",
         "area": [north, west, south, east],
     }
 
