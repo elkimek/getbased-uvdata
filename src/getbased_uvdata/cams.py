@@ -801,11 +801,14 @@ async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
     # when there's nothing to remove. _sweep_stale_staging itself only
     # logs at INFO when something was actually swept.
     def _sweep_now() -> None:
-        if not cache._cache_dir:
+        # getattr-with-default keeps test fixtures (FakeCache mocks etc)
+        # decoupled from this internal attribute. CamsCache always has it.
+        cache_dir = getattr(cache, "_cache_dir", None)
+        if not cache_dir:
             return
-        logger.debug("Periodic stage sweep starting in %s", cache._cache_dir)
+        logger.debug("Periodic stage sweep starting in %s", cache_dir)
         try:
-            _sweep_stale_staging(cache._cache_dir)
+            _sweep_stale_staging(cache_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning("Periodic stage sweep failed: %s", e)
 
