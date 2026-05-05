@@ -787,14 +787,27 @@ async def background_pull_loop(cache: CamsCache, interval_sec: int) -> None:
     # this, an OOM/SIGKILL during extract leaves ~534 MB orphan that
     # accumulates with every subsequent refresh attempt until the next
     # container restart finally sweeps them. Cheap (one listdir per
-    # interval) and runs before each refresh so the host has maximum
-    # headroom for the next transient peak.
+    # interval).
+    #
+    # Placement note: deliberately fires BEFORE refresh, not after the
+    # sleep. If a refresh crashes mid-extract, the orphan should be
+    # cleared before the NEXT refresh's transient peak hits — not 6 h
+    # later after the next sleep. The redundant sweep on boot (after
+    # CamsCache.__init__ already swept) is a one-shot listdir and
+    # bounded; trading it for crash-recovery promptness is the right
+    # call.
+    #
+    # Emits a DEBUG line every iteration so liveness is observable even
+    # when there's nothing to remove. _sweep_stale_staging itself only
+    # logs at INFO when something was actually swept.
     def _sweep_now() -> None:
-        if cache._cache_dir:
-            try:
-                _sweep_stale_staging(cache._cache_dir)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Periodic stage sweep failed: %s", e)
+        if not cache._cache_dir:
+            return
+        logger.debug("Periodic stage sweep starting in %s", cache._cache_dir)
+        try:
+            _sweep_stale_staging(cache._cache_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Periodic stage sweep failed: %s", e)
 
     # Initial pull on boot — server should serve real data ASAP. Failure
     # is logged but doesn't kill the process; reads return 503 (or serve
