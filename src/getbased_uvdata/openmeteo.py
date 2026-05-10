@@ -166,7 +166,8 @@ async def fetch_openmeteo(
         if cached and "forecast" in cached:
             logger.info(
                 "Open-Meteo forecast unavailable for (%.3f, %.3f); serving last-good cache",
-                lat_f, lon_f,
+                lat_f,
+                lon_f,
             )
             out["forecast"] = cached["forecast"]
             # Only fill airQuality from cache if the live fetch also

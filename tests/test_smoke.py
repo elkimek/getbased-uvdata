@@ -762,6 +762,4 @@ class TestOpenMeteoLastGoodFallback:
         assert len(om_mod._LAST_GOOD) == om_mod._LAST_GOOD_MAX_ENTRIES
         # Earliest entries gone, latest preserved.
         assert om_mod._last_good_get(0.0, 0.0) is None
-        assert om_mod._last_good_get(
-            float(om_mod._LAST_GOOD_MAX_ENTRIES + 4), 0.0
-        ) is not None
+        assert om_mod._last_good_get(float(om_mod._LAST_GOOD_MAX_ENTRIES + 4), 0.0) is not None
