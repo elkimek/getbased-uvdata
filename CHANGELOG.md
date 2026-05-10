@@ -4,6 +4,12 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-10
+
+### Fixed
+
+- **Open-Meteo merge no longer collapses to a sparse 1-row envelope on transient upstream failures.** When the Open-Meteo forecast leg timed out (1.5 s budget against a P50 of ~150 ms but real P99 jitter past 2 s) or 5xxd, `fetch_openmeteo` returned `{"airQuality": ...}` with no `forecast` key, and `build_response` fell into the CAMS-only synthesis path — emitting a single hourly row with `uv_index=null`, `cloud_cover=null`, `utc_offset_seconds=0`. The browser's sparse-uv merge branch (`js/sun-uvdata.js`) then re-fetched Open-Meteo client-side and labelled the source as `cams+open_meteo`, indistinguishable to users from a hard fallback away from the relay. Three changes together: (a) timeout raised 1.5 s → 5 s with separate 3 s connect budget; (b) shared `httpx.AsyncClient` created once at lifespan startup with HTTP/2 keepalive (8 keepalive conns, 32 max), eliminating the per-request TLS handshake — typical merge-leg latency drops from ~700 ms to ~150 ms; (c) per-coord last-good cache (LRU, 256 entries quantised to 0.1°, 30-min TTL) — when a fresh forecast fetch fails, the prior successful response is served instead of degrading to CAMS-only. The CAMS overlay still runs against the live snapshot so ozone/AOD reflect current state; only Open-Meteo-derived columns are stale-but-valid. Failure metric also tightened to count only fully-failed merges (was incrementing on partial successes).
+
 ## [0.1.3] — 2026-05-05
 
 ### Fixed

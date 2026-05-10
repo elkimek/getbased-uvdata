@@ -634,3 +634,134 @@ class TestServer:
                 headers={"Authorization": "Bearer secret-token-xyz"},
             )
             assert r.status_code == 200
+
+
+class TestOpenMeteoLastGoodFallback:
+    """Reproduce + lock down the sparse-envelope regression that
+    surfaced as `cams+open_meteo` in the browser source label.
+
+    Original failure mode: Open-Meteo forecast fetch times out, AQ
+    succeeds; `fetch_openmeteo` returned `{"airQuality": ...}` with no
+    forecast key; `build_response` fell into the CAMS-only synthesis
+    path and emitted a 1-row envelope with `uv_index=null` and
+    `cloud_cover=null`. The browser's sparse-uv branch (sun-uvdata.js)
+    then merged with its own Open-Meteo round trip, producing the
+    `cams+open_meteo` source string that users read as a hard fallback.
+
+    Fix: serve the per-coord last-good Open-Meteo forecast when the
+    fresh fetch fails, so the relay still returns a fully populated
+    multi-day envelope and the browser's sparse-uv branch never fires.
+    """
+
+    def test_last_good_serves_when_forecast_leg_fails(self, monkeypatch):
+        """First request seeds the cache; second request, with a
+        forecast that times out, falls back to the cached forecast
+        instead of returning an empty dict."""
+        import asyncio
+
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+
+        # Build two fake responses: a healthy first call (200 + JSON)
+        # and a failing second call (forecast raises, AQ 200).
+        good_forecast_json = {
+            "latitude": 50.1,
+            "longitude": 14.4,
+            "utc_offset_seconds": 7200,
+            "hourly": {
+                "time": ["2026-05-10T00:00", "2026-05-10T01:00"],
+                "uv_index": [0.0, 0.5],
+                "cloud_cover": [10, 15],
+            },
+        }
+        good_aq_json = {"current": {"european_aqi": 30}}
+
+        class FakeResp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+
+            def json(self):
+                return self._payload
+
+        class FlakyClient:
+            """Round 1: both legs succeed. Round 2: forecast raises
+            (simulating the timeout that caused the user-visible bug),
+            AQ still 200s."""
+
+            def __init__(self):
+                self.round = 0
+
+            async def get(self, url, params=None, timeout=None):
+                if "forecast" in url:
+                    self.round += 1
+                    if self.round >= 2:
+                        raise httpx.ReadTimeout("simulated forecast timeout")
+                    return FakeResp(good_forecast_json)
+                return FakeResp(good_aq_json)
+
+        import httpx  # noqa: F401  — used by FlakyClient typing/raise
+
+        client = FlakyClient()
+
+        # First call seeds the cache.
+        out1 = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=client))
+        assert "forecast" in out1, "first call should populate forecast"
+        assert out1["forecast"]["hourly"]["uv_index"] == [0.0, 0.5]
+
+        # Second call: forecast fails. Should serve cached forecast,
+        # NOT degrade to {airQuality: ...} only — that's the shape
+        # that produced the sparse-envelope bug downstream.
+        out2 = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=client))
+        assert "forecast" in out2, (
+            "forecast leg failed but last-good cache should fill it — "
+            "this is the regression that surfaced as cams+open_meteo "
+            "in the browser source label"
+        )
+        assert out2["forecast"]["hourly"]["uv_index"] == [0.0, 0.5]
+        # Live AQ must still win over cached AQ when both are present.
+        assert out2["airQuality"] == good_aq_json
+
+    def test_last_good_expires_after_ttl(self):
+        """A cached entry older than the TTL is dropped — we don't
+        want to serve hours-old forecasts indefinitely if Open-Meteo
+        is genuinely down."""
+        import asyncio
+        import time as _time
+
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+        # Seed the cache directly with a backdated stored_at so the
+        # TTL check fires without us having to monkeypatch time.time
+        # (which the cache itself reads through the same module).
+        om_mod._LAST_GOOD[(50.1, 14.4)] = {
+            "stored_at": _time.time() - om_mod._LAST_GOOD_TTL_SEC - 1,
+            "data": {"forecast": {"sentinel": 1}},
+        }
+
+        class AlwaysFail:
+            async def get(self, url, params=None, timeout=None):
+                raise RuntimeError("simulated total outage")
+
+        out = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=AlwaysFail()))
+        assert "forecast" not in out, "expired cache must NOT be served"
+        assert out == {}, "no fresh data + no live data = empty dict"
+
+    def test_lru_evicts_at_capacity(self):
+        """The bounded LRU caps memory growth — old buckets get
+        evicted as new coords come in. Important for a public relay
+        with global callers."""
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+        # Stuff in capacity+5 distinct coord buckets.
+        for i in range(om_mod._LAST_GOOD_MAX_ENTRIES + 5):
+            om_mod._last_good_put(float(i), 0.0, {"forecast": {"i": i}})
+        assert len(om_mod._LAST_GOOD) == om_mod._LAST_GOOD_MAX_ENTRIES
+        # Earliest entries gone, latest preserved.
+        assert om_mod._last_good_get(0.0, 0.0) is None
+        assert om_mod._last_good_get(
+            float(om_mod._LAST_GOOD_MAX_ENTRIES + 4), 0.0
+        ) is not None
