@@ -8,6 +8,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -51,6 +52,15 @@ async def lifespan(app: FastAPI):
     interval = int(os.environ.get("CAMS_PULL_INTERVAL_SEC", "21600"))
     task = asyncio.create_task(background_pull_loop(cache, interval))
     app.state.cams = cache
+    # Shared httpx client for the Open-Meteo merge path. Keeps TLS
+    # connections warm across requests, which drops typical merge-leg
+    # latency from ~700ms (cold handshake per call) to ~150ms and
+    # squashes the timeout-induced sparse responses that caused the
+    # browser to label the source as `cams+open_meteo`.
+    app.state.openmeteo_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0, connect=3.0),
+        limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
+    )
     yield
     task.cancel()
     try:
@@ -58,6 +68,12 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         # Expected — we just cancelled the task; awaiting re-raises so
         # the loop can finish its `finally` blocks. Nothing to handle.
+        pass
+    try:
+        await app.state.openmeteo_client.aclose()
+    except Exception:  # noqa: BLE001
+        # Shutdown path — never let a cleanup error mask the real
+        # exit reason.
         pass
 
 
@@ -164,8 +180,15 @@ async def uv(
     om = None
     if merge:
         _metrics["openmeteo_merges_total"] += 1
-        om = await fetch_openmeteo(latitude, longitude)
-        if not om:
+        # Use the shared client when lifespan wired one; tests that
+        # spin up `app` without lifespan (TestClient without `with`)
+        # fall through to a per-call client so they keep working.
+        shared_client = getattr(request.app.state, "openmeteo_client", None)
+        om = await fetch_openmeteo(latitude, longitude, client=shared_client)
+        # `om` carries `forecast` and/or `airQuality`; record a failure
+        # only when BOTH legs missed — the partial-success case still
+        # produces a valid merged response.
+        if not om or "forecast" not in om:
             _metrics["openmeteo_merge_failures_total"] += 1
 
     body = build_response(
