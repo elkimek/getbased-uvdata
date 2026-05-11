@@ -777,10 +777,13 @@ class TestOpenMeteoLastGoodFallback:
         from getbased_uvdata import openmeteo as om_mod
 
         om_mod._last_good_reset()
-        # Seed a near-TTL entry. If `stored_at` is refreshed on cache
-        # hit, this entry will live forever; if not, it expires on
-        # schedule.
-        seeded_at = _time.time() - om_mod._LAST_GOOD_TTL_SEC + 5
+        # Seed a mid-TTL entry — old enough that any refresh of
+        # `stored_at` would be unmissable in the assertion, but with
+        # enough headroom that a slow CI runner can't elapse the
+        # remaining TTL between seeding and the cache-hit lookup
+        # (a near-TTL seed would risk a flaky run where the entry
+        # expires mid-test and the cache-hit branch never fires).
+        seeded_at = _time.time() - om_mod._LAST_GOOD_TTL_SEC // 2
         om_mod._LAST_GOOD[(50.1, 14.4)] = {
             "stored_at": seeded_at,
             "data": {"forecast": {"hourly": {"uv_index": [1.0]}}},
@@ -804,9 +807,7 @@ class TestOpenMeteoLastGoodFallback:
         import httpx  # noqa: F401
 
         # Serve from cache — should NOT refresh stored_at.
-        out = asyncio.run(
-            om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFails())
-        )
+        out = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFails()))
         assert "forecast" in out, "cache should fill in the missing forecast"
 
         stored_at_after = om_mod._LAST_GOOD[(50.1, 14.4)]["stored_at"]
@@ -851,11 +852,7 @@ class TestOpenMeteoLastGoodFallback:
 
         import httpx  # noqa: F401
 
-        out = asyncio.run(
-            om_mod.fetch_openmeteo(
-                50.1, 14.4, client=ForecastFailsAqSucceeds()
-            )
-        )
+        out = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFailsAqSucceeds()))
 
         # Returned response should have stale forecast + fresh AQ.
         assert out["forecast"] == seeded_forecast

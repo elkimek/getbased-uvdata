@@ -203,8 +203,7 @@ async def fetch_openmeteo(
         prior = _LAST_GOOD.get(_coord_key(lat_f, lon_f))
         prior_fresh = (
             prior["data"]
-            if prior is not None
-            and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC
+            if prior is not None and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC
             else {}
         )
         _last_good_put(lat_f, lon_f, {**prior_fresh, **fresh})
@@ -215,10 +214,7 @@ async def fetch_openmeteo(
         # original schedule (defends against the stale-forever loop).
         key = _coord_key(lat_f, lon_f)
         prior = _LAST_GOOD.get(key)
-        if (
-            prior is not None
-            and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC
-        ):
+        if prior is not None and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC:
             prior["data"] = {**prior["data"], **fresh}
             _LAST_GOOD.move_to_end(key)  # LRU touch only
 
