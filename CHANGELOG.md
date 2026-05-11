@@ -4,6 +4,15 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-11
+
+### Fixed
+
+- **Last-good cache no longer refreshes its own `stored_at` on a cache-hit fallback.** v0.1.4's resilience cache stored the response after the cache-fill step, so a 30-min-old forecast served from cache got re-stamped with a fresh timestamp on every failing request and kept living forever — defeating `_LAST_GOOD_TTL_SEC` during sustained Open-Meteo outages and silently serving hours-old data labelled as fresh. The persist step now operates on the live-fetch dict only, never on data filled from the cache. A fresh AQ-only response is merged into the existing entry (preserving the cached forecast and its original `stored_at`) so partial successes don't blow away the forecast cache either.
+- **Differentiated connect timeout on the shared `httpx.AsyncClient` is no longer silently overridden per request.** `server.py` builds the shared client with `Timeout(5.0, connect=3.0)`, but `fetch_openmeteo` was passing `timeout=5.0` as a scalar on each `c.get()` call. httpx treats a per-request scalar as a full Timeout replacement — every field (including `connect`) collapsed to 5 s, eroding the headroom that gives the relay graceful degradation on cold-TLS spikes. The per-request override has been removed; the client's own Timeout applies. Owned (per-call) clients still get a `Timeout(5.0)` fallback for backwards compatibility.
+
+Both findings flagged by Greptile review on #14 (confidence 3/5). Two new regression tests in `TestOpenMeteoLastGoodFallback` lock down the cache-hit `stored_at` invariant and the no-per-request-`timeout=` invariant.
+
 ## [0.1.4] — 2026-05-10
 
 ### Fixed

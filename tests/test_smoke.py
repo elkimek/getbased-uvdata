@@ -763,3 +763,151 @@ class TestOpenMeteoLastGoodFallback:
         # Earliest entries gone, latest preserved.
         assert om_mod._last_good_get(0.0, 0.0) is None
         assert om_mod._last_good_get(float(om_mod._LAST_GOOD_MAX_ENTRIES + 4), 0.0) is not None
+
+    def test_cache_hit_does_not_refresh_stored_at(self):
+        """Greptile follow-up to #14: when the forecast leg fails and we
+        serve from the last-good cache, the cache entry must NOT be
+        re-stored with a fresh timestamp. Otherwise a 30-min-old
+        forecast keeps refreshing itself on every failed request and
+        never evicts — defeating _LAST_GOOD_TTL_SEC during sustained
+        Open-Meteo outages."""
+        import asyncio
+        import time as _time
+
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+        # Seed a near-TTL entry. If `stored_at` is refreshed on cache
+        # hit, this entry will live forever; if not, it expires on
+        # schedule.
+        seeded_at = _time.time() - om_mod._LAST_GOOD_TTL_SEC + 5
+        om_mod._LAST_GOOD[(50.1, 14.4)] = {
+            "stored_at": seeded_at,
+            "data": {"forecast": {"hourly": {"uv_index": [1.0]}}},
+        }
+
+        class ForecastFails:
+            async def get(self, url, params=None):
+                if "forecast" in url:
+                    raise httpx.ReadTimeout("simulated forecast timeout")
+                # AQ returns 200 — that's the failure mode that
+                # produced the sparse `cams+open_meteo` envelope.
+
+                class _R:
+                    status_code = 200
+
+                    def json(self):
+                        return {"current": {"european_aqi": 30}}
+
+                return _R()
+
+        import httpx  # noqa: F401
+
+        # Serve from cache — should NOT refresh stored_at.
+        out = asyncio.run(
+            om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFails())
+        )
+        assert "forecast" in out, "cache should fill in the missing forecast"
+
+        stored_at_after = om_mod._LAST_GOOD[(50.1, 14.4)]["stored_at"]
+        assert stored_at_after == seeded_at, (
+            "cache entry's stored_at was refreshed by the cache-hit fallback "
+            "path — that defeats _LAST_GOOD_TTL_SEC and lets stale forecasts "
+            "live forever during sustained outages"
+        )
+
+    def test_fresh_aq_does_not_clobber_cached_forecast(self):
+        """Greptile follow-up to #14: when the forecast leg fails but AQ
+        succeeds, persisting `out` (which contains a cache-derived
+        forecast plus fresh AQ) would re-stamp the stale forecast with
+        a fresh timestamp. The fix instead merges fresh fields over the
+        prior fresh entry, preserving the forecast's original
+        `stored_at`."""
+        import asyncio
+        import time as _time
+
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+        seeded_at = _time.time() - 60  # 1 min ago, well within TTL
+        seeded_forecast = {"hourly": {"uv_index": [0.0, 0.5]}}
+        om_mod._LAST_GOOD[(50.1, 14.4)] = {
+            "stored_at": seeded_at,
+            "data": {"forecast": seeded_forecast},
+        }
+
+        class ForecastFailsAqSucceeds:
+            async def get(self, url, params=None):
+                if "forecast" in url:
+                    raise httpx.ReadTimeout("simulated forecast timeout")
+
+                class _R:
+                    status_code = 200
+
+                    def json(self):
+                        return {"current": {"european_aqi": 42}}
+
+                return _R()
+
+        import httpx  # noqa: F401
+
+        out = asyncio.run(
+            om_mod.fetch_openmeteo(
+                50.1, 14.4, client=ForecastFailsAqSucceeds()
+            )
+        )
+
+        # Returned response should have stale forecast + fresh AQ.
+        assert out["forecast"] == seeded_forecast
+        assert out["airQuality"] == {"current": {"european_aqi": 42}}
+
+        # Cache: forecast `stored_at` must NOT be refreshed (otherwise
+        # stale-forecast lives indefinitely). Implementation merges
+        # fresh AQ into the prior entry, so prior entry's stored_at
+        # is preserved.
+        entry = om_mod._LAST_GOOD[(50.1, 14.4)]
+        assert entry["stored_at"] == seeded_at, (
+            "stale forecast's stored_at was refreshed when fresh AQ landed"
+        )
+        # Fresh AQ should also be persisted so the next fetch can fall
+        # back to it if both legs fail.
+        assert entry["data"].get("airQuality") == {"current": {"european_aqi": 42}}
+        # Forecast still the original.
+        assert entry["data"].get("forecast") == seeded_forecast
+
+    def test_no_per_request_timeout_override(self):
+        """Greptile follow-up to #14: production code must NOT pass a
+        scalar `timeout=` kwarg per request. httpx treats a per-request
+        scalar as a full `Timeout(..., connect=..., read=..., write=...,
+        pool=...)` replacement, which silently overrides the shared
+        client's differentiated `Timeout(5.0, connect=3.0)` config and
+        collapses connect back to 5s. Verify by capturing `get()` kwargs."""
+        import asyncio
+
+        from getbased_uvdata import openmeteo as om_mod
+
+        om_mod._last_good_reset()
+
+        captured_kwargs: list[dict] = []
+
+        class KwargCapture:
+            async def get(self, url, **kwargs):
+                captured_kwargs.append(kwargs)
+
+                class _R:
+                    status_code = 200
+
+                    def json(self):
+                        return {"hourly": {"time": [], "uv_index": []}}
+
+                return _R()
+
+        asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=KwargCapture()))
+
+        assert len(captured_kwargs) == 2, "both legs should fire"
+        for kw in captured_kwargs:
+            assert "timeout" not in kw, (
+                f"fetch_openmeteo passed timeout={kw.get('timeout')!r} per request — "
+                "that overrides the shared client's Timeout(5.0, connect=3.0) and "
+                "collapses connect back to 5s"
+            )

@@ -124,26 +124,38 @@ async def fetch_openmeteo(
         "current": "pm2_5,pm10,european_aqi",
         "past_days": 2,
     }
-    out: dict = {}
+    # `fresh` tracks ONLY data from the live fetch — never anything we
+    # filled from the last-good cache. `out` is what we return to the
+    # caller (fresh + cache-fill). Persisting `fresh` instead of `out`
+    # is what prevents a stale-but-served cache entry from rewriting
+    # itself with a fresh timestamp on every failed request — which
+    # would defeat _LAST_GOOD_TTL_SEC during sustained Open-Meteo
+    # outages (Greptile follow-up to #14).
+    fresh: dict = {}
     # Use the shared client when available; fall back to a per-call
-    # client so existing call sites and tests keep working.
+    # client so existing call sites and tests keep working. We rely
+    # on the client's own Timeout config (the server creates the
+    # shared one with `Timeout(5.0, connect=3.0)`) and do NOT pass a
+    # per-request `timeout=` scalar — that would override every field
+    # of the Timeout, collapsing the differentiated connect budget
+    # back to a flat 5s (Greptile follow-up to #14).
     owned_client = client is None
-    c = client or httpx.AsyncClient(timeout=_OPENMETEO_TIMEOUT_SEC)
+    c = client or httpx.AsyncClient(timeout=httpx.Timeout(_OPENMETEO_TIMEOUT_SEC))
     try:
         fc_resp, aq_resp = await _gather_safe(
-            c.get(fc_url, params=fc_params, timeout=_OPENMETEO_TIMEOUT_SEC),
-            c.get(aq_url, params=aq_params, timeout=_OPENMETEO_TIMEOUT_SEC),
+            c.get(fc_url, params=fc_params),
+            c.get(aq_url, params=aq_params),
         )
         if fc_resp is not None and fc_resp.status_code == 200:
             try:
-                out["forecast"] = fc_resp.json()
+                fresh["forecast"] = fc_resp.json()
             except Exception as e:  # noqa: BLE001
                 logger.warning("Open-Meteo forecast JSON parse failed: %s", e)
         elif fc_resp is not None:
             logger.warning("Open-Meteo forecast non-200: %s", fc_resp.status_code)
         if aq_resp is not None and aq_resp.status_code == 200:
             try:
-                out["airQuality"] = aq_resp.json()
+                fresh["airQuality"] = aq_resp.json()
             except Exception as e:  # noqa: BLE001
                 logger.warning("Open-Meteo airQuality JSON parse failed: %s", e)
     except Exception as e:  # noqa: BLE001
@@ -154,6 +166,8 @@ async def fetch_openmeteo(
                 await c.aclose()
             except Exception:  # noqa: BLE001
                 pass
+
+    out: dict = dict(fresh)
 
     # Resilience step — if the forecast leg failed (this is the path
     # that produces sparse 1-row envelopes downstream), serve the
@@ -175,12 +189,38 @@ async def fetch_openmeteo(
             if "airQuality" not in out and "airQuality" in cached:
                 out["airQuality"] = cached["airQuality"]
 
-    # Persist the fresh response (or the merged fresh+cached response)
-    # for future fallback. We deliberately store whatever we have —
-    # even a forecast-only or airQuality-only shape gives the next
-    # failed fetch SOMETHING to fall back to.
-    if "forecast" in out or "airQuality" in out:
-        _last_good_put(lat_f, lon_f, dict(out))
+    # Persist ONLY fresh data, never re-persist cache-served data.
+    # The rule is "only refresh `stored_at` when forecast is fresh" —
+    # otherwise a stale forecast served from cache would keep extending
+    # its own TTL on every failing request. Fresh AQ alongside a stale
+    # forecast still updates the entry's `data` (so the next fetch can
+    # fall back to a more recent AQ) but the entry's `stored_at` stays
+    # anchored to whenever the forecast was last successfully fetched.
+    if "forecast" in fresh:
+        # Fresh forecast → full refresh with current timestamp,
+        # merging any still-fresh AQ from the prior entry so we don't
+        # lose it if the AQ leg happened to fail this round.
+        prior = _LAST_GOOD.get(_coord_key(lat_f, lon_f))
+        prior_fresh = (
+            prior["data"]
+            if prior is not None
+            and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC
+            else {}
+        )
+        _last_good_put(lat_f, lon_f, {**prior_fresh, **fresh})
+    elif "airQuality" in fresh:
+        # AQ-only fresh — update the existing entry's data in place
+        # so future fallbacks see the more recent AQ, but PRESERVE
+        # its `stored_at` so the cached forecast still expires on its
+        # original schedule (defends against the stale-forever loop).
+        key = _coord_key(lat_f, lon_f)
+        prior = _LAST_GOOD.get(key)
+        if (
+            prior is not None
+            and time.time() - prior["stored_at"] <= _LAST_GOOD_TTL_SEC
+        ):
+            prior["data"] = {**prior["data"], **fresh}
+            _LAST_GOOD.move_to_end(key)  # LRU touch only
 
     return out
 
