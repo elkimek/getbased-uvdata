@@ -15,7 +15,7 @@
 services:
   uvdata:
     build: .
-    image: getbased/uvdata:0.1.0
+    image: getbased/uvdata:0.1.6
     restart: unless-stopped
     env_file: .env
     # 127.0.0.1 binding — public access goes through the host's reverse

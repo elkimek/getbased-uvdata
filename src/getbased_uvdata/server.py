@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
 import re
+import time as _time
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-
-import time as _time
 
 from . import __version__
 from .auth import check_bearer, required_bearer
@@ -25,7 +26,6 @@ from .spectrum import (
     solar_zenith_angle,
     uvi_from_spectrum,
 )
-
 
 # Counter state — small, in-memory, no Prometheus client lib dep.
 # Increments race-free under FastAPI's single-process model; if you
@@ -107,9 +107,12 @@ for raw in os.environ.get("ALLOWED_ORIGINS", "").split(","):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_DEFAULT_ORIGINS + _extra,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["authorization", "content-type"],
 )
+
+_PRIVATE_UV_MAX_BODY_BYTES = 2048
+_PRIVATE_UV_ALLOWED_KEYS = frozenset({"latitude", "longitude", "time"})
 
 
 def _get_cache(request: Request) -> CamsCache:
@@ -144,6 +147,7 @@ async def root() -> dict:
         "version": __version__,
         "docs": "https://github.com/elkimek/getbased-uvdata",
         "endpoints": {
+            "POST /v1/uv": "privacy-rounded CAMS-only lookup for trusted relays",
             "GET /uv?latitude=&longitude=&time=": "per-coord CAMS atmosphere snapshot, Open-Meteo-shaped",
             "GET /healthz": "liveness + grid metadata",
         },
@@ -161,30 +165,103 @@ async def uv(
     with Open-Meteo. Response shape mirrors Open-Meteo's hourly
     forecast so the browser's existing parser ingests it directly."""
     check_bearer(request)
+    merge = os.environ.get("MERGE_OPENMETEO", "1") not in ("0", "false", "no", "")
+    return await _serve_uv(request, latitude, longitude, time, merge_openmeteo=merge)
+
+
+@app.post("/v1/uv")
+async def private_uv(request: Request):
+    """CAMS-only lookup for the fixed getbased application relay.
+
+    The body is deliberately small and flat, coordinates are rounded again
+    at this trust boundary, and this route never invokes or caches a
+    per-coordinate third-party request. POST also keeps coordinates out of
+    normal HTTP access-log request lines.
+    """
+    if required_bearer() is None:
+        raise HTTPException(status_code=503, detail="Private route requires a configured bearer")
+    check_bearer(request)
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > _PRIVATE_UV_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body exceeds size cap")
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    keys = set(payload)
+    if not {"latitude", "longitude"}.issubset(keys) or not keys.issubset(_PRIVATE_UV_ALLOWED_KEYS):
+        raise HTTPException(
+            status_code=400, detail="Request body contains unsupported or missing fields"
+        )
+
+    latitude = _finite_coordinate(payload["latitude"], minimum=-90, maximum=90, name="latitude")
+    longitude = _finite_coordinate(
+        payload["longitude"], minimum=-180, maximum=180, name="longitude"
+    )
+    time_value = payload.get("time")
+    if time_value is not None and (
+        not isinstance(time_value, str) or not time_value or len(time_value) > 40
+    ):
+        raise HTTPException(status_code=400, detail="time must be a bounded ISO-8601 string")
+
+    # Enforce the privacy grid independently of the browser and Vercel proxy.
+    latitude = _privacy_round(latitude)
+    longitude = _privacy_round(longitude)
+    return await _serve_uv(
+        request,
+        latitude,
+        longitude,
+        time_value,
+        merge_openmeteo=False,
+        privacy_rounded=True,
+    )
+
+
+async def _serve_uv(
+    request: Request,
+    latitude: float,
+    longitude: float,
+    time_value: str | None,
+    *,
+    merge_openmeteo: bool,
+    privacy_rounded: bool = False,
+):
     cache: CamsCache = request.app.state.cams
     snap = cache.snapshot
     if snap is None:
+        detail = (
+            "CAMS grid not yet available"
+            if privacy_rounded
+            else (f"CAMS grid not yet available. Last error: {cache.last_error or 'still pulling'}")
+        )
         raise HTTPException(
             status_code=503,
-            detail=f"CAMS grid not yet available. Last error: {cache.last_error or 'still pulling'}",
+            detail=detail,
         )
 
     started = _time.monotonic()
     _metrics["uv_requests_total"] += 1
 
-    when_iso = time or _now_iso_utc()
+    when_iso = time_value or _now_iso_utc()
     when_epoch = _iso_to_epoch(when_iso)
     cams_lookup = snap.lookup(latitude, longitude, when_epoch)
 
-    merge = os.environ.get("MERGE_OPENMETEO", "1") not in ("0", "false", "no", "")
     om = None
-    if merge:
+    if merge_openmeteo:
         _metrics["openmeteo_merges_total"] += 1
         # Use the shared client when lifespan wired one; tests that
         # spin up `app` without lifespan (TestClient without `with`)
         # fall through to a per-call client so they keep working.
         shared_client = getattr(request.app.state, "openmeteo_client", None)
-        om = await fetch_openmeteo(latitude, longitude, client=shared_client)
+        om = await fetch_openmeteo(latitude, longitude, when_iso=when_iso, client=shared_client)
         # `om` carries `forecast` and/or `airQuality`; record a failure
         # only when BOTH legs missed — the partial-success case still
         # produces a valid merged response.
@@ -202,21 +279,6 @@ async def uv(
         snapshot_valid_to=snap.valid_to,
         snapshot=snap,
     )
-    # Server-computed daily peak UVI: scan today's hours, run the
-    # spectrum reconstruction at each, take the max. Cheap (~25 spectrum
-    # calcs at 5-nm grid) and gives a number that beats Open-Meteo's
-    # pre-computed peak because it's fed real CAMS ozone + AOD per hour.
-    # Overlays into the existing `daily.uv_index_max` slot so the browser
-    # picks it up via its existing parser without further changes.
-    try:
-        daily = body.setdefault("daily", {})
-        peak, peak_at = _daily_peak_uvi(snap, latitude, longitude, when_epoch)
-        if peak is not None:
-            daily["uv_index_max_cams"] = [round(peak, 2)]
-            if peak_at is not None:
-                daily["uv_index_max_cams_at"] = [_dt_to_iso(peak_at)]
-    except Exception as e:  # noqa: BLE001 — daily peak is bonus; never break /uv
-        logger.warning("Daily peak UVI computation failed: %s", e)
     # Stale-grid header — monitors / browser can detect silent
     # staleness without parsing _camsMeta. Body still serves so the
     # session can complete; the browser's own freshness UI flags it.
@@ -226,9 +288,34 @@ async def uv(
     headers = {}
     if cache.is_stale:
         headers["X-Cams-Stale"] = "1"
+    if privacy_rounded:
+        headers["X-Coordinate-Precision"] = "0.1"
     _metrics["uv_requests_2xx"] += 1
     _metrics["uv_request_duration_sum_sec"] += _time.monotonic() - started
     return JSONResponse(content=body, headers=headers)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("Duplicate JSON key")
+        out[key] = value
+    return out
+
+
+def _finite_coordinate(value: object, *, minimum: float, maximum: float, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HTTPException(status_code=400, detail=f"{name} must be a finite number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < minimum or numeric > maximum:
+        raise HTTPException(status_code=400, detail=f"Invalid {name}")
+    return numeric
+
+
+def _privacy_round(value: float) -> float:
+    rounded = math.floor(value * 10 + 0.5) / 10
+    return 0.0 if rounded == 0 else rounded
 
 
 @app.get("/spectrum")
@@ -261,6 +348,11 @@ async def spectrum(
     when_iso = time or _now_iso_utc()
     when_epoch = _iso_to_epoch(when_iso)
     cams_lookup = snap.lookup(latitude, longitude, when_epoch)
+    if cams_lookup.get("_camsTimeInRange") is False:
+        raise HTTPException(
+            status_code=422,
+            detail="Requested time is outside the available CAMS snapshot; refusing to reconstruct a spectrum from a boundary timestep.",
+        )
     zenith = solar_zenith_angle(when_epoch, latitude, longitude)
     spec = reconstruct_spectrum(
         zenith_deg=zenith,
@@ -341,48 +433,6 @@ async def metrics(request: Request) -> Response:
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
-def _daily_peak_uvi(
-    snap: "CamsCache.snapshot",  # type: ignore[name-defined]
-    lat: float,
-    lon: float,
-    around_epoch: float,
-) -> tuple[float | None, float | None]:
-    """Scan ±12 hours around `around_epoch`, run the spectrum at each
-    snapshot timestep, return (peak UVI, epoch of peak). Returns
-    (None, None) when no timestep falls in the window."""
-    if snap is None:
-        return None, None
-    window_low = around_epoch - 12 * 3600
-    window_high = around_epoch + 12 * 3600
-    best_uvi: float | None = None
-    best_t: float | None = None
-    for t_epoch in snap.times:
-        if t_epoch < window_low or t_epoch > window_high:
-            continue
-        zenith = solar_zenith_angle(float(t_epoch), lat, lon)
-        if zenith >= 90:  # sun below horizon — UVI is zero by definition
-            continue
-        lookup = snap.lookup(lat, lon, float(t_epoch))
-        spec = reconstruct_spectrum(
-            zenith_deg=zenith,
-            ozone_du=lookup.get("ozoneDU") or 300.0,
-            altitude_m=0,
-            cloud_cover=0,
-            aod=lookup.get("aod"),
-        )
-        u = uvi_from_spectrum(spec)
-        if best_uvi is None or u > best_uvi:
-            best_uvi = u
-            best_t = float(t_epoch)
-    return best_uvi, best_t
-
-
-def _dt_to_iso(epoch: float) -> str:
-    import datetime as dt
-
-    return dt.datetime.fromtimestamp(epoch, tz=dt.UTC).strftime("%Y-%m-%dT%H:%M")
-
-
 def _now_iso_utc() -> str:
     import datetime as dt
 
@@ -424,7 +474,19 @@ def main() -> None:
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8324"))
-    uvicorn.run("getbased_uvdata.server:app", host=host, port=port, log_level="info")
+    access_log = os.environ.get("UVICORN_ACCESS_LOG", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    uvicorn.run(
+        "getbased_uvdata.server:app",
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=access_log,
+    )
 
 
 def _doctor() -> int:

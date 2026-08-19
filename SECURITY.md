@@ -55,6 +55,8 @@ We assume:
 - CDS-API exception strings are scrubbed before they reach `/healthz` body, response headers, or stdout (live values of `CAMS_API_KEY` / `GETBASED_UVDATA_BEARER` substitution).
 - `/metrics` is bearer-gated. `/healthz` is open but minimal-info.
 - CORS is a deny-by-default allowlist; operator extras must validate as `scheme://host[:port]`.
+- The authenticated `POST /v1/uv` path fails closed unless a bearer is configured, caps and allowlists its JSON body, re-rounds coordinates to 0.1°, performs a CAMS-only in-memory lookup, and never invokes the optional Open-Meteo merge/cache.
+- The bundled Uvicorn launcher disables request-line access logs by default so legacy coordinate-bearing query strings are not retained. Operators using another ASGI launcher must apply an equivalent logging policy.
 
 ## What's NOT a vulnerability we can act on
 

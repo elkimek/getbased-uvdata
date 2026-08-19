@@ -4,6 +4,23 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-19
+
+### Added
+
+- **Authenticated, privacy-minimised `POST /v1/uv` route for the hosted app relay.** The route fails closed unless `GETBASED_UVDATA_BEARER` is configured, accepts only a bounded JSON object, rejects duplicate or extra fields, re-rounds coordinates to 0.1°, and performs only an in-memory CAMS lookup. It does not forward request coordinates to Open-Meteo or Copernicus and keeps them out of the request URL.
+- **Direct CAMS UV dose-rate fields.** Total-sky and clear-sky biologically effective UV dose rates now anchor the returned UVI, with explicit field-level provenance and out-of-range handling instead of silently clamping to a boundary timestep.
+
+### Security
+
+- Request-line access logs are disabled by default in the bundled Uvicorn launcher because legacy `GET /uv` and `/spectrum` URLs contain coordinates. Operators using another ASGI launcher must apply the same logging policy.
+- Upstream error logging is sanitised so request coordinates and query strings are not written through exception messages.
+
+### Changed
+
+- CAMS-only hosted lookups no longer invoke the optional Open-Meteo merge or populate its per-coordinate cache. The legacy authenticated endpoints remain available for existing and self-hosted clients.
+- The Compose image tag now tracks the application release version.
+
 ## [0.1.5] — 2026-05-11
 
 ### Fixed
