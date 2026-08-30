@@ -132,7 +132,7 @@ for raw in os.environ.get("UVDATA_TRUSTED_PROXY_CIDRS", "").split(","):
     try:
         _trusted_proxy_networks.append(ipaddress.ip_network(value, strict=False))
     except ValueError:
-        logger.warning("Ignoring invalid UVDATA_TRUSTED_PROXY_CIDRS entry: %r", raw)
+        logger.warning("Ignoring invalid UVDATA_TRUSTED_PROXY_CIDRS entry")
 _TRUSTED_PROXY_NETWORKS = tuple(_trusted_proxy_networks)
 _RATE_BUCKETS: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _RATE_BUCKET_MAX = 10_000
