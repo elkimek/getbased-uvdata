@@ -8,19 +8,52 @@ hosted instance behind health monitoring.
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import time
 
+import httpx
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 
 from getbased_uvdata.cams import CamsCache, GridSnapshot
 from getbased_uvdata.reshape import build_response
 
 
+class _ASGIClient:
+    """Small synchronous wrapper around httpx's in-process ASGI transport.
+
+    It intentionally skips application lifespan because server tests inject a
+    deterministic CAMS cache and must never start a real CDS background pull.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    def request(self, method: str, path: str, **kwargs):
+        async def _request():
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="https://testserver"
+            ) as client:
+                return await client.request(method, path, **kwargs)
+
+        return asyncio.run(_request())
+
+    def get(self, path: str, **kwargs):
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self.request("POST", path, **kwargs)
+
+    def close(self):
+        return None
+
+
 def _fake_snapshot(with_aq: bool = False) -> GridSnapshot:
     """One-hour, 2x2 grid with predictable values for assertion math."""
-    now = time.time()
+    # Whole-second precision round-trips exactly through an ISO-8601 request.
+    now = float(int(time.time()))
     times = np.array([now], dtype=float)
     lats = np.array([10.0, 0.0])  # descending, CAMS convention
     lons = np.array([0.0, 10.0])
@@ -98,6 +131,25 @@ class TestGridLookup:
         # Way before the snapshot — clamps to first timestep, not 404.
         out = snap.lookup(10.0, 0.0, snap.times[0] - 86400)
         assert abs(out["ozoneDU"] - 300.0) < 1e-9
+        assert out["_camsTimeInRange"] is False
+
+    def test_nearest_time_uses_the_closest_hour(self):
+        snap = _fake_snapshot()
+        snap.times = np.array([1000.0, 2000.0])
+        snap.ozone_du = np.array(
+            [[[300.0, 300.0], [300.0, 300.0]], [[330.0, 330.0], [330.0, 330.0]]]
+        )
+        snap.aod_550 = np.array([[[0.1, 0.1], [0.1, 0.1]], [[0.2, 0.2], [0.2, 0.2]]])
+        assert snap.lookup(5.0, 5.0, 1200.0)["ozoneDU"] == 300.0
+        assert snap.lookup(5.0, 5.0, 1800.0)["ozoneDU"] == 330.0
+
+    def test_direct_cams_uv_is_interpolated(self):
+        snap = _fake_snapshot()
+        snap.uv_index = np.array([[[4.0, 6.0], [8.0, 10.0]]])
+        snap.uv_index_clear_sky = np.array([[[5.0, 7.0], [9.0, 11.0]]])
+        out = snap.lookup(5.0, 5.0, snap.times[0])
+        assert out["uvIndexCams"] == 7.0
+        assert out["uvClearSkyCams"] == 8.0
 
     def test_air_quality_fields_surface_when_present(self):
         """Lookup includes AQ fields when the snapshot carries them.
@@ -352,6 +404,7 @@ class TestRetryBackoff:
         cadence once a refresh succeeds. Validates the failure-counter
         as a side effect."""
         import asyncio as _asyncio
+
         from getbased_uvdata import cams as cams_mod
 
         # Sequence: fail, fail, succeed, then loop forever sleeping.
@@ -429,7 +482,63 @@ class TestReshape:
         assert "ozone_du" in resp["hourly"]
         assert resp["hourly"]["ozone_du"] == [305.0]
         assert resp["hourly"]["aod"] == [0.12]
-        assert resp["_camsMeta"]["source"] == "cams"
+        assert resp["_camsMeta"]["source"] == "cams_global_forecast"
+
+    def test_cams_only_uses_direct_uvbed_not_reconstruction(self):
+        cams = {
+            "ozoneDU": 305.0,
+            "aod": 0.12,
+            "uvIndexCams": 5.4,
+            "uvClearSkyCams": 6.2,
+            "_camsTimeInRange": True,
+        }
+        resp = build_response(
+            lat=50.0,
+            lon=14.0,
+            when_iso="2026-05-04T10:30Z",
+            cams_lookup=cams,
+            openmeteo=None,
+            cams_pulled_at=1700000000,
+            snapshot_valid_from=1700000000,
+            snapshot_valid_to=1700086400,
+        )
+        assert resp["hourly"]["uv_index"] == [5.4]
+        assert resp["hourly"]["uv_index_clear_sky"] == [6.2]
+        assert resp["hourly"]["uv_index_source"] == ["cams_uvbed"]
+        assert resp["_fieldSources"]["uvIndex"] == "cams_uvbed"
+
+    def test_historical_request_does_not_reuse_current_cams_boundary(self):
+        snap = _fake_snapshot()
+        snap.uv_index = np.array([[[9.0, 9.0], [9.0, 9.0]]])
+        snap.uv_index_clear_sky = np.array([[[10.0, 10.0], [10.0, 10.0]]])
+        old_epoch = snap.times[0] - 10 * 86400
+        old_iso = dt.datetime.fromtimestamp(old_epoch, tz=dt.UTC).isoformat()
+        lookup = snap.lookup(5.0, 5.0, old_epoch)
+        om = {
+            "forecast": {
+                "utc_offset_seconds": 0,
+                "hourly": {
+                    "time": [old_iso[:16]],
+                    "uv_index": [2.1],
+                    "uv_index_clear_sky": [2.8],
+                },
+            },
+        }
+        resp = build_response(
+            lat=5.0,
+            lon=5.0,
+            when_iso=old_iso,
+            cams_lookup=lookup,
+            openmeteo=om,
+            cams_pulled_at=snap.pulled_at,
+            snapshot_valid_from=snap.valid_from,
+            snapshot_valid_to=snap.valid_to,
+            snapshot=snap,
+        )
+        assert resp["hourly"]["uv_index"] == [2.1]
+        assert resp["hourly"]["uv_index_source"] == ["open_meteo_gfs"]
+        assert "ozone_du" not in resp["hourly"]
+        assert resp["_camsMeta"]["requestedTimeInRange"] is False
 
     def test_merge_overlays_cams_extras_into_openmeteo_envelope(self):
         cams = {"ozoneDU": 290.0, "aod": 0.08}
@@ -468,6 +577,7 @@ class TestReshape:
         snapshot's leadtime axis — different hours of the day pick up
         different ozone/AOD values, not a flat broadcast."""
         import time as _time
+
         import numpy as np
 
         from getbased_uvdata.cams import GridSnapshot
@@ -525,18 +635,18 @@ class TestServer:
         monkeypatch.setenv("CAMS_CACHE_DIR", "")
         from getbased_uvdata.server import app as real_app
 
-        client = TestClient(real_app)
-        with client:
-            real_app.state.cams = type(
-                "FakeCache",
-                (),
-                {
-                    "snapshot": _fake_snapshot(),
-                    "is_stale": False,
-                    "last_error": None,
-                },
-            )()
-            yield client
+        client = _ASGIClient(real_app)
+        real_app.state.cams = type(
+            "FakeCache",
+            (),
+            {
+                "snapshot": _fake_snapshot(),
+                "is_stale": False,
+                "last_error": None,
+            },
+        )()
+        yield client
+        client.close()
 
     def test_healthz_reports_grid_metadata(self, client_with_cache):
         r = client_with_cache.get("/healthz")
@@ -612,12 +722,97 @@ class TestServer:
     def test_uv_returns_cams_fields(self, client_with_cache, monkeypatch):
         # Disable Open-Meteo merge so we don't make real outbound calls.
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
-        r = client_with_cache.get("/uv?latitude=10&longitude=0")
+        from getbased_uvdata.server import app as real_app
+
+        snapshot_time = dt.datetime.fromtimestamp(
+            real_app.state.cams.snapshot.times[0], tz=dt.UTC
+        ).isoformat()
+        r = client_with_cache.get(
+            "/uv",
+            params={"latitude": 10, "longitude": 0, "time": snapshot_time},
+        )
         assert r.status_code == 200
         body = r.json()
         assert body["hourly"]["ozone_du"][0] == 300.0
         assert body["hourly"]["aod"][0] == 0.10
-        assert body["_camsMeta"]["source"] == "cams"
+        assert body["_camsMeta"]["source"] == "cams_global_forecast"
+
+    def test_private_uv_rounds_coordinates_and_never_calls_openmeteo(
+        self, client_with_cache, monkeypatch
+    ):
+        """The official relay path stays local even if legacy merging is enabled."""
+        monkeypatch.setenv("MERGE_OPENMETEO", "1")
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "private-test")
+        from getbased_uvdata import server as server_mod
+
+        async def unexpected_openmeteo(*args, **kwargs):
+            raise AssertionError("private CAMS route must not call Open-Meteo")
+
+        monkeypatch.setattr(server_mod, "fetch_openmeteo", unexpected_openmeteo)
+        r = client_with_cache.post(
+            "/v1/uv",
+            json={"latitude": 5.06, "longitude": 5.04},
+            headers={"Authorization": "Bearer private-test"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["latitude"] == 5.1
+        assert body["longitude"] == 5.0
+        assert r.headers["x-coordinate-precision"] == "0.1"
+
+    @pytest.mark.parametrize(
+        ("body", "status"),
+        [
+            ({"latitude": 5, "longitude": 5, "url": "https://example.com"}, 400),
+            ({"latitude": True, "longitude": 5}, 400),
+            ({"latitude": 91, "longitude": 5}, 400),
+            ({"latitude": 5, "longitude": 5, "time": ""}, 400),
+        ],
+    )
+    def test_private_uv_rejects_non_contract_fields(
+        self, client_with_cache, monkeypatch, body, status
+    ):
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "private-test")
+        r = client_with_cache.post(
+            "/v1/uv", json=body, headers={"Authorization": "Bearer private-test"}
+        )
+        assert r.status_code == status
+
+    def test_private_uv_rejects_wrong_content_type_duplicates_and_large_bodies(
+        self, client_with_cache, monkeypatch
+    ):
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "private-test")
+        auth = {"Authorization": "Bearer private-test"}
+        wrong_type = client_with_cache.post(
+            "/v1/uv", content=b"{}", headers={**auth, "Content-Type": "text/plain"}
+        )
+        assert wrong_type.status_code == 415
+        duplicate = client_with_cache.post(
+            "/v1/uv",
+            content=b'{"latitude":5,"latitude":6,"longitude":5}',
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        assert duplicate.status_code == 400
+        oversized = client_with_cache.post(
+            "/v1/uv",
+            content=b" " * 2049,
+            headers={**auth, "Content-Type": "application/json"},
+        )
+        assert oversized.status_code == 413
+
+    def test_private_uv_fails_closed_without_configured_bearer(
+        self, client_with_cache, monkeypatch
+    ):
+        monkeypatch.delenv("GETBASED_UVDATA_BEARER", raising=False)
+        r = client_with_cache.post("/v1/uv", json={"latitude": 5, "longitude": 5})
+        assert r.status_code == 503
+
+    def test_legacy_get_uv_keeps_self_host_precision(self, client_with_cache, monkeypatch):
+        monkeypatch.setenv("MERGE_OPENMETEO", "0")
+        r = client_with_cache.get("/uv?latitude=5.06&longitude=5.04")
+        assert r.status_code == 200
+        assert r.json()["latitude"] == 5.06
+        assert r.json()["longitude"] == 5.04
 
     def test_metrics_requires_bearer_when_set(self, client_with_cache, monkeypatch):
         """/metrics is bearer-gated — no exposure of internal pull
@@ -674,32 +869,32 @@ class TestServer:
         monkeypatch.setenv("GETBASED_UVDATA_BEARER", "secret-token-xyz")
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
         monkeypatch.setenv("CAMS_CACHE_DIR", "")
-        client = TestClient(real_app)
-        with client:
-            real_app.state.cams = type(
-                "FakeCache",
-                (),
-                {
-                    "snapshot": _fake_snapshot(),
-                    "is_stale": False,
-                    "last_error": None,
-                },
-            )()
-            # No bearer → 401
-            r = client.get("/uv?latitude=10&longitude=0")
-            assert r.status_code == 401
-            # Wrong bearer → 401
-            r = client.get(
-                "/uv?latitude=10&longitude=0",
-                headers={"Authorization": "Bearer wrong"},
-            )
-            assert r.status_code == 401
-            # Correct bearer → 200
-            r = client.get(
-                "/uv?latitude=10&longitude=0",
-                headers={"Authorization": "Bearer secret-token-xyz"},
-            )
-            assert r.status_code == 200
+        client = _ASGIClient(real_app)
+        real_app.state.cams = type(
+            "FakeCache",
+            (),
+            {
+                "snapshot": _fake_snapshot(),
+                "is_stale": False,
+                "last_error": None,
+            },
+        )()
+        # No bearer → 401
+        r = client.get("/uv?latitude=10&longitude=0")
+        assert r.status_code == 401
+        # Wrong bearer → 401
+        r = client.get(
+            "/uv?latitude=10&longitude=0",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert r.status_code == 401
+        # Correct bearer → 200
+        r = client.get(
+            "/uv?latitude=10&longitude=0",
+            headers={"Authorization": "Bearer secret-token-xyz"},
+        )
+        assert r.status_code == 200
+        client.close()
 
 
 class TestOpenMeteoLastGoodFallback:
@@ -775,6 +970,7 @@ class TestOpenMeteoLastGoodFallback:
         out1 = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=client))
         assert "forecast" in out1, "first call should populate forecast"
         assert out1["forecast"]["hourly"]["uv_index"] == [0.0, 0.5]
+        om_mod._LAST_GOOD[(50.1, 14.4)]["stored_at"] -= om_mod._FRESH_CACHE_TTL_SEC + 1
 
         # Second call: forecast fails. Should serve cached forecast,
         # NOT degrade to {airQuality: ...} only — that's the shape
@@ -896,7 +1092,7 @@ class TestOpenMeteoLastGoodFallback:
         from getbased_uvdata import openmeteo as om_mod
 
         om_mod._last_good_reset()
-        seeded_at = _time.time() - 60  # 1 min ago, well within TTL
+        seeded_at = _time.time() - om_mod._FRESH_CACHE_TTL_SEC - 60
         seeded_forecast = {"hourly": {"uv_index": [0.0, 0.5]}}
         om_mod._LAST_GOOD[(50.1, 14.4)] = {
             "stored_at": seeded_at,
@@ -967,7 +1163,7 @@ class TestOpenMeteoLastGoodFallback:
 
         asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=KwargCapture()))
 
-        assert len(captured_kwargs) == 2, "both legs should fire"
+        assert len(captured_kwargs) == 3, "weather, AQ, and satellite legs should fire"
         for kw in captured_kwargs:
             assert "timeout" not in kw, (
                 f"fetch_openmeteo passed timeout={kw.get('timeout')!r} per request — "

@@ -6,6 +6,11 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [0.1.6] — 2026-08-30
 
+### Added
+
+- **Authenticated, privacy-minimised `POST /v1/uv` route for the hosted app relay.** The route fails closed unless `GETBASED_UVDATA_BEARER` is configured, accepts only a bounded JSON object, rejects duplicate or extra fields, re-rounds coordinates to 0.1°, and performs only an in-memory CAMS lookup. It does not forward request coordinates to Open-Meteo or Copernicus and keeps them out of the request URL.
+- **Direct CAMS UV dose-rate fields.** Total-sky and clear-sky biologically effective UV dose rates now anchor the returned UVI, with explicit field-level provenance and out-of-range handling instead of silently clamping to a boundary timestep.
+
 ### Fixed
 
 - CAMS refreshes no longer retain raw decoded grids beside normalized arrays. Live and persisted grids are normalized to float32 and xarray's decoded-array cache is disabled, eliminating the repeated 1.5 GiB cgroup OOM loop without reducing the global bounding box, five-day forecast, or response precision.
@@ -14,6 +19,13 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 - Protected data routes now have a bounded per-source request limiter after bearer authentication, so unauthenticated traffic cannot consume valid clients' buckets. The deployment uses a dedicated client-IP header which is accepted only from configured proxy networks and which Caddy overwrites from the socket peer; ordinary caller-controlled `X-Forwarded-For` is ignored.
 - The runtime container now has a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, PID and memory boundaries, an init process, and a digest-pinned Python base image.
+- Request-line access logs are disabled by default in the bundled Uvicorn launcher because legacy `GET /uv` and `/spectrum` URLs contain coordinates. Operators using another ASGI launcher must apply the same logging policy.
+- Upstream error logging is sanitised so request coordinates and query strings are not written through exception messages.
+
+### Changed
+
+- CAMS-only hosted lookups no longer invoke the optional Open-Meteo merge or populate its per-coordinate cache. The legacy authenticated endpoints remain available for existing and self-hosted clients.
+- The Compose image tag now tracks the application release version.
 
 ## [0.1.5] — 2026-05-11
 

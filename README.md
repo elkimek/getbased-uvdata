@@ -4,26 +4,28 @@ CAMS-fed UV/atmosphere relay for the [getbased.health](https://getbased.health) 
 
 Pulls the [CAMS Atmospheric Composition Forecast](https://atmosphere.copernicus.eu/) on a schedule, indexes the grid in memory, and serves per-coord/per-hour lookups in the same JSON shape the browser already accepts from Open-Meteo. A `/spectrum` endpoint runs server-side Bird-Riordan reconstruction so browsers can skip their own client-side reconstruction step.
 
-**Why this exists.** Open-Meteo's free tier doesn't expose total-column ozone in Dobson Units — only surface µg/m³ pollution ozone, which doesn't drive UVB transmission. CAMS gives the real KNMI-validated DU value plus AOD@550 nm + PM2.5/PM10 from the same satellite-assimilated source Open-Meteo wraps for AQ. Feeding those into the Bird-Riordan radiative-transfer engine collapses the model uncertainty band from ±20–45% to ±10–15% in the UV sweet-spot.
+**Why this exists.** Open-Meteo's free tier doesn't expose total-column ozone in Dobson Units — only surface µg/m³ pollution ozone, which doesn't drive UVB transmission. CAMS supplies direct total-sky and clear-sky biologically effective UV dose rate (converted to UVI), total-column ozone, AOD@550 nm, and particulates. Direct CAMS UV anchors the headline UVI; the local Bird-Riordan model remains an explicitly modeled wavelength-resolved input for exploratory wellness channels.
 
 ```
         [browser]
             │  POST {meteo: 'cams', latitude, longitude, time}
             ▼
         [/api/proxy]   <- Vercel function, injects bearer server-side
-            │  GET /uv?... + Authorization: Bearer …
+            │  POST /v1/uv + Authorization: Bearer …
             ▼
         [getbased-uvdata]   <- this repo
             │
             ├─ background pull every 6 h ──> CAMS ADS (CDS-API)
-            └─ on /uv ──> Open-Meteo (cloud cover / temp / UVI baseline)
+            ├─ POST /v1/uv ──> local in-memory CAMS grid only
+            └─ legacy GET /uv ──> optional Open-Meteo weather and
+                                   DWD/EUMETSAT radiation context
 ```
 
 ## Two ways to use it
 
 ### Hosted
 
-The browser calls `/api/proxy?meteo=cams&...` on the Lab Charts app domain; the Vercel proxy forwards to the maintainer-run instance with the bearer injected server-side. No setup needed by app users — they just toggle Settings → Light & Sun → Sun Data Source → CAMS.
+The browser posts `{meteo: "cams", ...}` to `/api/proxy` on the getbased app domain. That function rounds coordinates to 0.1° and sends a bounded JSON body to the authenticated `POST /v1/uv` route. The relay rounds again and performs only a lookup in its pre-downloaded CAMS grid: it does not send or cache the request coordinates through Open-Meteo or Copernicus. Copernicus receives only the relay operator's scheduled grid/bounding-box download. The browser falls back directly to Open-Meteo if the CAMS-only response is unavailable or lacks a usable UVI.
 
 ### Self-host
 
@@ -57,10 +59,11 @@ Then in the app: **Settings → Light & Sun → Sun Data Source → Self-hosted 
 | `CAMS_PULL_INTERVAL_SEC` | `21600` | How often to refresh the grid. CAMS publishes every 12 h; 6 h covers a missed cycle. |
 | `CAMS_PULL_TIMEOUT_SEC` | `600` | Per-pull timeout. CDS queue worst-case is ~5 min; this caps it at 10 to prevent a wedged thread from holding the lock forever. |
 | `CAMS_FORECAST_HORIZON_HOURS` | `120` | Forecast horizon in hours (24–120). Hourly through day 1, 3-hourly through day 5. |
-| `CAMS_DATE_OVERRIDE` | _(empty)_ | Force a fixed forecast date (`YYYY-MM-DD`) instead of "today". Only useful on clock-shifted dev boxes; leave empty in production. |
+| `CAMS_DATE_OVERRIDE` | _(empty)_ | Force a fixed forecast date (`YYYY-MM-DD`) instead of the default previous UTC day. Only useful for testing/backfills; leave empty in production. |
 | `CAMS_CACHE_DIR` | `/data` | Directory the latest snapshot persists to. On restart the server warm-starts from this file instead of waiting for a fresh CDS pull. Empty string disables persistence. |
 | `GETBASED_UVDATA_BEARER` | _(empty)_ | Token clients must present in `Authorization: Bearer …`. **Always set in production** — empty mode lets any reachable client burn your CAMS quota. |
-| `MERGE_OPENMETEO` | `1` | Merge Open-Meteo clouds/temp/UVI into the response. Set `0` for CAMS-only — useful if you want fewer servers in the data path. |
+| `MERGE_OPENMETEO` | `1` | Merge Open-Meteo weather/fallback UVI and recent DWD/EUMETSAT radiation observations. Set `0` for CAMS-only. |
+| `UVICORN_ACCESS_LOG` | `0` | Opt in to Uvicorn request-line access logs. Disabled by default because legacy `GET /uv` URLs contain coordinates. |
 | `ALLOWED_ORIGINS` | _(empty)_ | Extra CORS origins (comma-separated) on top of `https://app.getbased.health` + `https://getbased.health`. Each must be `scheme://host[:port]`. |
 | `UVDATA_RATE_LIMIT_PER_MINUTE` | `300` | Per-source request cap for `/uv`, `/spectrum`, and `/metrics`; `0` disables it. |
 | `UVDATA_CLIENT_IP_HEADER` | _(empty)_ | Dedicated reverse-proxy-overwritten client-IP header used by the limiter. Compose sets `x-getbased-client-ip`; configure Caddy as shown in `docker-compose.yml`. Ordinary `X-Forwarded-For` is never trusted. |
@@ -94,16 +97,25 @@ Liveness probe (no bearer required). Minimal info — detailed pull state lives 
 ### `GET /uv?latitude=&longitude=&time=`
 
 Returns Open-Meteo-shaped JSON with extra hourly arrays:
+- `hourly.uv_index_cams_total_sky[i]` — direct CAMS biologically effective dose rate converted to UVI.
+- `hourly.uv_index_cams_clear_sky[i]` — direct CAMS clear-sky biologically effective dose rate converted to UVI.
+- `hourly.uv_index_satellite_adjusted[i]` — CAMS clear-sky UVI multiplied by a bounded recent observed/clear-sky broadband radiation ratio, when available.
+- `hourly.uv_index_source[i]` — field-level provenance (`cams_uvbed`, `cams_uvbedcs+satellite_cmf`, or `open_meteo_gfs`).
 - `hourly.ozone_du[i]` — total column ozone in Dobson Units, from CAMS.
 - `hourly.aod[i]` — 550 nm aerosol optical depth, from CAMS.
 - `hourly.pm2_5[i]` / `hourly.pm10[i]` — surface particulates in µg/m³, from CAMS.
-- `daily.uv_index_max_cams[]` / `daily.uv_index_max_cams_at[]` — server-computed daily peak UVI from Bird-Riordan reconstruction.
+- `daily.uv_index_max[]`, `daily.uv_index_max_at[]`, and `daily.uv_index_max_source[]` — peaks calculated from the same fused hourly UVI series.
+- `_fieldSources` and `_openMeteoMeta` — requested-time provenance and freshness metadata.
 
-`time` is optional; defaults to "now". Bearer required if `GETBASED_UVDATA_BEARER` is set. Sets `X-Cams-Stale: 1` header when the in-memory grid is past its 24h freshness window.
+`time` is optional; defaults to "now". When it falls outside the available CAMS forecast snapshot, CAMS values are not clamped into that date; a date-matched Open-Meteo historical-forecast response remains the fallback. Bearer required if `GETBASED_UVDATA_BEARER` is set. Sets `X-Cams-Stale: 1` when the in-memory grid is past its 24h freshness window.
+
+### `POST /v1/uv`
+
+Authenticated, CAMS-only route for a trusted same-operator application relay. It fails closed with `503` unless `GETBASED_UVDATA_BEARER` is configured, accepts only a JSON object containing numeric `latitude`, numeric `longitude`, and an optional bounded ISO-8601 `time`, and requires the matching bearer. The request body is capped at 2 KiB, duplicate or additional keys are rejected, and coordinates are rounded to 0.1° before lookup. This route never invokes Open-Meteo, never creates a per-coordinate cache entry, and keeps coordinates out of the HTTP request URL. It returns `X-Coordinate-Precision: 0.1`.
 
 ### `GET /spectrum?latitude=&longitude=&time=&altitude_m=&cloud_cover=`
 
-Server-side Bird-Riordan reconstruction fed by REAL CAMS ozone + AOD. Returns wavelength-resolved surface UV (W/m²/nm, 280–2500 nm @ 5 nm) plus the integrated UVI:
+Server-side Bird-Riordan reconstruction fed by CAMS ozone + AOD. Returns modeled wavelength-resolved surface irradiance (W/m²/nm, 280–2500 nm @ 5 nm) plus its integrated UVI. This endpoint rejects times outside the loaded CAMS snapshot rather than substituting a boundary timestep:
 
 ```json
 {
@@ -192,7 +204,7 @@ Attempting a live CAMS pull (30 s - 5 min depending on CDS queue)...
 ## Operational notes
 
 - **First request after boot** waits for the initial CAMS pull. CDS-API queue time is typically 30 s – 5 min depending on global load. Endpoint returns `503` until the first pull completes.
-- **Memory footprint**: bounded by the compose cgroup. Global fields are normalized to float32 and xarray's decoded-grid cache is disabled, preventing the raw and normalized grids from accumulating together during refresh.
+- **Memory footprint** is bounded by the configured grid, forecast horizon, requested variable roster, and Compose cgroup. Global fields are normalized to float32 and xarray's decoded-grid cache is disabled, preventing raw and normalized grids from accumulating together during refresh.
 - **CDS-API quotas**: free tier is 4 concurrent requests / user. With one pull every 6 h there's no realistic way to hit the limit on a per-instance basis. Multi-instance fleets should set `CAMS_PULL_INTERVAL_SEC` higher and share a snapshot via `CAMS_CACHE_DIR` on a shared volume.
 - **Stale grid**: if a pull fails, the previous snapshot keeps serving. `/healthz.cams.stale` flips `true` after 24 h with no successful refresh; `getbased_uvdata_snapshot_stale` mirrors it on `/metrics`. Monitor both.
 - **Single-worker only.** `_metrics` counters are per-process; running with `--workers N > 1` produces fragmented metrics. Front the relay with a reverse proxy if you need horizontal scaling.
@@ -213,7 +225,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting and the threat model.
 
 ## Architecture decisions
 
-For deeper context on why we run Bird-Riordan server-side instead of pulling CAMS-McRad directly, why NO2/SO2/CO aren't in this repo's pull, and what data CAMS does *not* provide for the getbased use case — see the project memory in the [Lab Charts repository](https://github.com/elkimek/get-based).
+For deeper context on the direct-CAMS UVI anchor, the separate modeled spectrum path, and what CAMS does *not* provide for the getbased use case, see the project memory in the [getbased repository](https://github.com/elkimek/get-based).
 
 ## License
 
