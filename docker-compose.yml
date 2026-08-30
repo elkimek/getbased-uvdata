@@ -7,7 +7,9 @@
 #      between it and the world. Caddy snippet:
 #
 #         uvdata.getbased.health {
-#           reverse_proxy localhost:8324
+#           reverse_proxy localhost:8324 {
+#             header_up X-Getbased-Client-IP {http.request.remote.host}
+#           }
 #         }
 #   4. Point Settings → Light & Sun → Sun Data Source at:
 #        https://<your-host>/uv  with the bearer you set above.
@@ -15,13 +17,22 @@
 services:
   uvdata:
     build: .
-    image: getbased/uvdata:0.1.0
+    image: getbased/uvdata:0.1.6
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Caddy must overwrite this dedicated header from the socket peer. The
+      # app validates it as one IP, accepts it only from a trusted proxy peer,
+      # and ignores ordinary X-Forwarded-For.
+      UVDATA_CLIENT_IP_HEADER: "x-getbased-client-ip"
+      # Docker publishes host-originated proxy traffic from a 172.16/12 bridge
+      # gateway. Keep the port loopback-only; use a narrower CIDR when your
+      # deployment has a fixed gateway address.
+      UVDATA_TRUSTED_PROXY_CIDRS: "${UVDATA_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}"
+      UVDATA_RATE_LIMIT_PER_MINUTE: "${UVDATA_RATE_LIMIT_PER_MINUTE:-300}"
     # 127.0.0.1 binding — public access goes through the host's reverse
-    # proxy, so the container never speaks raw HTTP to the internet.
-    # Self-hosters who want direct exposure (LAN-only, behind a separate
-    # firewall) can override to "0.0.0.0:8324:8324".
+    # proxy, so the container never speaks raw HTTP to the internet. Do not
+    # publish this port publicly while proxy-header trust is enabled.
     ports:
       - "127.0.0.1:8324:8324"
     volumes:
@@ -29,15 +40,21 @@ services:
     # Memory cap — hard ceiling on the container's RSS so a pull
     # spike can never starve other services on the same host (evolu-
     # relay / context-gateway co-tenancy). Steady state stays around
-    # 150-250 MB; the transient peak hits during the CAMS pull when
-    # the 234 MB zip is decoded by xarray with all four AQ variables
-    # in flight (peaks observed at ~900 MB-1.1 GB on the global grid).
-    # Earlier 512m cap was sized for the single-variable snapshot
-    # before PM2.5/PM10/AQ added; OOM-killed every pull mid-decode
-    # (auto-restart cleaned up the staging dir via the v0.1.1 sweep,
-    # but the snapshot never landed). 1500m leaves comfortable
-    # headroom on a 2 GB VPS while still capping a runaway.
-    mem_limit: 1500m
+    # The loader normalizes every global field to float32 and disables
+    # xarray's decoded-array cache. 2 GiB preserves enough transient headroom
+    # to refresh a five-day global grid while still containing a runaway on a
+    # 4 GiB host. Steady state is substantially lower.
+    mem_limit: 2g
+    mem_reservation: 768m
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
     logging:
       driver: json-file
       options:

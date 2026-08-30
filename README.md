@@ -62,6 +62,9 @@ Then in the app: **Settings → Light & Sun → Sun Data Source → Self-hosted 
 | `GETBASED_UVDATA_BEARER` | _(empty)_ | Token clients must present in `Authorization: Bearer …`. **Always set in production** — empty mode lets any reachable client burn your CAMS quota. |
 | `MERGE_OPENMETEO` | `1` | Merge Open-Meteo clouds/temp/UVI into the response. Set `0` for CAMS-only — useful if you want fewer servers in the data path. |
 | `ALLOWED_ORIGINS` | _(empty)_ | Extra CORS origins (comma-separated) on top of `https://app.getbased.health` + `https://getbased.health`. Each must be `scheme://host[:port]`. |
+| `UVDATA_RATE_LIMIT_PER_MINUTE` | `300` | Per-source request cap for `/uv`, `/spectrum`, and `/metrics`; `0` disables it. |
+| `UVDATA_CLIENT_IP_HEADER` | _(empty)_ | Dedicated reverse-proxy-overwritten client-IP header used by the limiter. Compose sets `x-getbased-client-ip`; configure Caddy as shown in `docker-compose.yml`. Ordinary `X-Forwarded-For` is never trusted. |
+| `UVDATA_TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated proxy source networks permitted to supply `UVDATA_CLIENT_IP_HEADER`. Compose trusts only the Docker bridge range and keeps the published port on loopback. Use a narrower CIDR for a fixed gateway. |
 | `HOST` / `PORT` | `0.0.0.0` / `8324` | Listen address. |
 
 ## Endpoints
@@ -189,7 +192,7 @@ Attempting a live CAMS pull (30 s - 5 min depending on CDS queue)...
 ## Operational notes
 
 - **First request after boot** waits for the initial CAMS pull. CDS-API queue time is typically 30 s – 5 min depending on global load. Endpoint returns `503` until the first pull completes.
-- **Memory footprint**: ~150 MB for a global grid at 0.4° resolution × 24 hourly steps × 4 fields. Bounded — no growth over time.
+- **Memory footprint**: bounded by the compose cgroup. Global fields are normalized to float32 and xarray's decoded-grid cache is disabled, preventing the raw and normalized grids from accumulating together during refresh.
 - **CDS-API quotas**: free tier is 4 concurrent requests / user. With one pull every 6 h there's no realistic way to hit the limit on a per-instance basis. Multi-instance fleets should set `CAMS_PULL_INTERVAL_SEC` higher and share a snapshot via `CAMS_CACHE_DIR` on a shared volume.
 - **Stale grid**: if a pull fails, the previous snapshot keeps serving. `/healthz.cams.stale` flips `true` after 24 h with no successful refresh; `getbased_uvdata_snapshot_stale` mirrors it on `/metrics`. Monitor both.
 - **Single-worker only.** `_metrics` counters are per-process; running with `--workers N > 1` produces fragmented metrics. Front the relay with a reverse proxy if you need horizontal scaling.

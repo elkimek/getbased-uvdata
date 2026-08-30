@@ -373,29 +373,36 @@ class CamsCache:
         if not os.path.exists(path):
             return
         try:
-            data = np.load(path, allow_pickle=False)
+            with np.load(path, allow_pickle=False) as data:
 
-            def _opt(key: str) -> np.ndarray | None:
-                # `key in data` is supported on NpzFile but cheap to be
-                # defensive — older snapshots predate the AQ fields.
-                return data[key] if key in data.files else None
+                def _grid(key: str) -> np.ndarray:
+                    # Persisted snapshots from older releases may be float64.
+                    # Normalizing them on load halves steady-state RAM without
+                    # changing any response field or interpolation behavior at
+                    # meaningful atmospheric precision.
+                    return np.asarray(data[key], dtype=np.float32)
 
-            self._snapshot = GridSnapshot(
-                pulled_at=float(data["pulled_at"]),
-                valid_from=float(data["valid_from"]),
-                valid_to=float(data["valid_to"]),
-                times=data["times"],
-                lats=data["lats"],
-                lons=data["lons"],
-                ozone_du=data["ozone_du"],
-                aod_550=data["aod_550"],
-                pm2_5=_opt("pm2_5"),
-                pm10=_opt("pm10"),
-                no2=_opt("no2"),
-                so2=_opt("so2"),
-                co=_opt("co"),
-                o3_surface=_opt("o3_surface"),
-            )
+                def _opt(key: str) -> np.ndarray | None:
+                    # `key in data` is supported on NpzFile but cheap to be
+                    # defensive — older snapshots predate the AQ fields.
+                    return _grid(key) if key in data.files else None
+
+                self._snapshot = GridSnapshot(
+                    pulled_at=float(data["pulled_at"]),
+                    valid_from=float(data["valid_from"]),
+                    valid_to=float(data["valid_to"]),
+                    times=np.asarray(data["times"], dtype=float),
+                    lats=np.asarray(data["lats"], dtype=np.float32),
+                    lons=np.asarray(data["lons"], dtype=np.float32),
+                    ozone_du=_grid("ozone_du"),
+                    aod_550=_grid("aod_550"),
+                    pm2_5=_opt("pm2_5"),
+                    pm10=_opt("pm10"),
+                    no2=_opt("no2"),
+                    so2=_opt("so2"),
+                    co=_opt("co"),
+                    o3_surface=_opt("o3_surface"),
+                )
             age_h = (time.time() - self._snapshot.pulled_at) / 3600
             logger.info(
                 "Loaded snapshot from disk: %.1f h old, %s timesteps",
@@ -528,7 +535,11 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
         # "did not find a match in any of xarray's currently installed
         # IO backends" error.
         nc_path = _materialize_netcdf(out, td)
-        ds = xr.open_dataset(nc_path, decode_times=True, engine="netcdf4")
+        # cache=False is essential on the global grid: xarray must not retain
+        # a second decoded copy of each field after we normalize it to
+        # float32 below. Keeping both float64/raw and float32 grids was the
+        # source of the production 1.5 GiB cgroup OOM loop.
+        ds = xr.open_dataset(nc_path, decode_times=True, engine="netcdf4", cache=False)
         # Variable rename: CDS short names are stable but verbose; map to
         # our internal keys here so the rest of the code stays clean.
         var_map = {
@@ -573,16 +584,16 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
         # (T, LAT, LON) regardless of how many wrap dimensions CDS chose
         # to add. Without this an arbitrary singleton axis breaks the
         # (T, LAT, LON) assumption downstream.
-        ozone = np.squeeze(ds["ozone_du"].values)
+        ozone = np.asarray(np.squeeze(ds["ozone_du"].values), dtype=np.float32)
         if ozone.ndim != 3:
             raise RuntimeError(
                 f"CAMS ozone_du array has unexpected shape {ozone.shape} after squeeze; expected (T, LAT, LON)"
             )
         units = ds["ozone_du"].attrs.get("units", "").lower()
         if "kg" in units:
-            ozone = ozone / 2.1414e-5
+            ozone /= np.float32(2.1414e-5)
 
-        aod = np.squeeze(ds["aod_550"].values)
+        aod = np.asarray(np.squeeze(ds["aod_550"].values), dtype=np.float32)
         if aod.ndim != 3:
             raise RuntimeError(
                 f"CAMS aod_550 array has unexpected shape {aod.shape} after squeeze; expected (T, LAT, LON)"
@@ -600,12 +611,12 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
         def _aq(name: str) -> np.ndarray | None:
             if name not in ds:
                 return None
-            arr = np.squeeze(ds[name].values)
+            arr = np.asarray(np.squeeze(ds[name].values), dtype=np.float32)
             if arr.ndim != 3:
                 return None
             units = ds[name].attrs.get("units", "").lower().replace(" ", "")
             if any(u.replace(" ", "") in units for u in _KG_VOLUME_UNITS):
-                arr = arr * 1e9
+                arr *= np.float32(1e9)
             elif "kg" in units:
                 # Unknown kg-based unit — skip the convert + warn. The
                 # raw value still flows through; downstream consumers
@@ -636,8 +647,8 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
         times = (
             np.asarray(raw_times).reshape(-1).astype("datetime64[s]").astype(np.int64).astype(float)
         )
-        lats = ds["latitude"].values.astype(float)
-        lons = ds["longitude"].values.astype(float)
+        lats = ds["latitude"].values.astype(np.float32)
+        lons = ds["longitude"].values.astype(np.float32)
 
         # Sort lats descending (CAMS convention) so np.argmin behaves.
         # The same flip must reach every (T, LAT, LON) data array — UV
@@ -683,7 +694,7 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             if o3_surface is not None:
                 o3_surface = o3_surface[order, :, :]
 
-        return GridSnapshot(
+        snapshot = GridSnapshot(
             pulled_at=time.time(),
             valid_from=float(times[0]),
             valid_to=float(times[-1]),
@@ -699,6 +710,11 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             co=co,
             o3_surface=o3_surface,
         )
+        # Close the netCDF handle before the staging directory is removed and
+        # before the old in-memory snapshot can overlap the new one any longer
+        # than necessary.
+        ds.close()
+        return snapshot
 
 
 def _today_utc_iso() -> str:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import ipaddress
 import logging
 import os
 import re
@@ -39,6 +41,7 @@ _metrics: dict[str, int | float] = {
     "uv_request_duration_sum_sec": 0.0,
     "openmeteo_merges_total": 0,
     "openmeteo_merge_failures_total": 0,
+    "rate_limited_total": 0,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
@@ -110,6 +113,97 @@ app.add_middleware(
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["authorization", "content-type"],
 )
+
+# Per-source request limiting lives in the application instead of relying on a
+# non-standard Caddy module. A dedicated proxy-overwritten header is accepted
+# only from explicitly trusted proxy networks; all other requests are keyed on
+# the socket peer. The default is deliberately generous for shared networks.
+_RATE_LIMIT_PER_MINUTE = int(os.environ.get("UVDATA_RATE_LIMIT_PER_MINUTE", "300"))
+_CLIENT_IP_HEADER = os.environ.get("UVDATA_CLIENT_IP_HEADER", "").strip().lower()
+if _CLIENT_IP_HEADER and not re.fullmatch(r"[a-z0-9-]+", _CLIENT_IP_HEADER):
+    logger.warning("Ignoring invalid UVDATA_CLIENT_IP_HEADER value")
+    _CLIENT_IP_HEADER = ""
+_TRUSTED_PROXY_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+_trusted_proxy_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+for raw in os.environ.get("UVDATA_TRUSTED_PROXY_CIDRS", "").split(","):
+    value = raw.strip()
+    if not value:
+        continue
+    try:
+        _trusted_proxy_networks.append(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        logger.warning("Ignoring invalid UVDATA_TRUSTED_PROXY_CIDRS entry")
+_TRUSTED_PROXY_NETWORKS = tuple(_trusted_proxy_networks)
+_RATE_BUCKETS: OrderedDict[str, tuple[float, int]] = OrderedDict()
+_RATE_BUCKET_MAX = 10_000
+
+
+def _rate_limit_check(ip: str, now: float | None = None, limit: int | None = None) -> bool:
+    """Fixed one-minute window with bounded source tracking."""
+    current = _time.monotonic() if now is None else now
+    maximum = _RATE_LIMIT_PER_MINUTE if limit is None else limit
+    if maximum <= 0:
+        return True
+    started, count = _RATE_BUCKETS.pop(ip, (current, 0))
+    if current - started >= 60:
+        started, count = current, 0
+    count += 1
+    _RATE_BUCKETS[ip] = (started, count)
+    while len(_RATE_BUCKETS) > _RATE_BUCKET_MAX:
+        _RATE_BUCKETS.popitem(last=False)
+    return count <= maximum
+
+
+def _request_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    try:
+        peer_ip = ipaddress.ip_address(peer.strip())
+    except ValueError:
+        return "unknown"
+
+    trusted_peer = any(peer_ip in network for network in _TRUSTED_PROXY_NETWORKS)
+    if not (_CLIENT_IP_HEADER and trusted_peer):
+        return peer_ip.compressed
+
+    candidate = request.headers.get(_CLIENT_IP_HEADER, "").strip()
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        # Never let a proxy bug or malformed value mint arbitrary bucket keys.
+        return peer_ip.compressed
+
+
+@app.middleware("http")
+async def security_and_rate_limit(request: Request, call_next):
+    protected = request.url.path in ("/uv", "/spectrum", "/metrics")
+    if protected:
+        # Authenticate before consuming a source bucket. Otherwise an
+        # unauthenticated caller sharing an address with a legitimate client
+        # could exhaust that client's allowance without knowing the bearer.
+        try:
+            check_bearer(request)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+        if not _rate_limit_check(_request_ip(request)):
+            _metrics["rate_limited_total"] += 1
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "rate_limited"},
+                headers={"Retry-After": "60", "Cache-Control": "no-store"},
+            )
+    response = await call_next(request)
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 def _get_cache(request: Request) -> CamsCache:
