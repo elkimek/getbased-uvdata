@@ -135,12 +135,17 @@ class TestSnapshotPersistence:
         # Fresh cache instance reads the file on init.
         cache_b = CamsCache(cache_dir=str(tmp_path))
         assert cache_b.snapshot is not None
+        assert cache_b.snapshot.ozone_du.dtype == np.float32
+        assert cache_b.snapshot.aod_550.dtype == np.float32
         # Lookups match between original and reloaded snapshots.
         for lat, lon in [(10.0, 0.0), (5.0, 5.0), (0.0, 10.0)]:
             a = original.lookup(lat, lon, original.times[0])
             b = cache_b.snapshot.lookup(lat, lon, original.times[0])
-            assert abs(a["ozoneDU"] - b["ozoneDU"]) < 1e-9
-            assert abs(a["aod"] - b["aod"]) < 1e-9
+            # The persisted loader intentionally normalizes old float64 grids
+            # to float32; atmospheric inputs retain far more precision than
+            # the public response while cutting their RAM footprint in half.
+            assert abs(a["ozoneDU"] - b["ozoneDU"]) < 1e-5
+            assert abs(a["aod"] - b["aod"]) < 1e-6
 
     def test_missing_file_is_silent(self, tmp_path):
         """Empty cache directory just yields no snapshot — not an error."""
@@ -542,6 +547,15 @@ class TestServer:
         # endpoint — see the security audit. It lives on /metrics behind
         # the bearer.
         assert "last_error" not in body["cams"]
+
+    def test_rate_limiter_is_bounded_and_resets_after_window(self):
+        from getbased_uvdata import server as server_mod
+
+        server_mod._RATE_BUCKETS.clear()
+        assert server_mod._rate_limit_check("198.51.100.1", now=10.0, limit=2)
+        assert server_mod._rate_limit_check("198.51.100.1", now=11.0, limit=2)
+        assert not server_mod._rate_limit_check("198.51.100.1", now=12.0, limit=2)
+        assert server_mod._rate_limit_check("198.51.100.1", now=71.0, limit=2)
 
     def test_uv_returns_cams_fields(self, client_with_cache, monkeypatch):
         # Disable Open-Meteo merge so we don't make real outbound calls.

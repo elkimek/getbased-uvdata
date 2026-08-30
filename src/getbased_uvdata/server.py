@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import logging
 import os
 import re
@@ -39,6 +40,7 @@ _metrics: dict[str, int | float] = {
     "uv_request_duration_sum_sec": 0.0,
     "openmeteo_merges_total": 0,
     "openmeteo_merge_failures_total": 0,
+    "rate_limited_total": 0,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
@@ -110,6 +112,57 @@ app.add_middleware(
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["authorization", "content-type"],
 )
+
+# Per-source request limiting lives in the application instead of relying on a
+# non-standard Caddy module. The hosted deployment is reachable only through
+# the local reverse proxy, so its left-most X-Forwarded-For address is the real
+# client. Self-hosters can leave UVDATA_TRUST_PROXY unset and key on the direct
+# peer instead. The default is deliberately generous for shared networks.
+_RATE_LIMIT_PER_MINUTE = int(os.environ.get("UVDATA_RATE_LIMIT_PER_MINUTE", "300"))
+_TRUST_PROXY = os.environ.get("UVDATA_TRUST_PROXY", "").lower() in ("1", "true", "yes")
+_RATE_BUCKETS: OrderedDict[str, tuple[float, int]] = OrderedDict()
+_RATE_BUCKET_MAX = 10_000
+
+
+def _rate_limit_check(ip: str, now: float | None = None, limit: int | None = None) -> bool:
+    """Fixed one-minute window with bounded source tracking."""
+    current = _time.monotonic() if now is None else now
+    maximum = _RATE_LIMIT_PER_MINUTE if limit is None else limit
+    if maximum <= 0:
+        return True
+    started, count = _RATE_BUCKETS.pop(ip, (current, 0))
+    if current - started >= 60:
+        started, count = current, 0
+    count += 1
+    _RATE_BUCKETS[ip] = (started, count)
+    while len(_RATE_BUCKETS) > _RATE_BUCKET_MAX:
+        _RATE_BUCKETS.popitem(last=False)
+    return count <= maximum
+
+
+def _request_ip(request: Request) -> str:
+    if _TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+@app.middleware("http")
+async def security_and_rate_limit(request: Request, call_next):
+    protected = request.url.path in ("/uv", "/spectrum", "/metrics")
+    if protected and not _rate_limit_check(_request_ip(request)):
+        _metrics["rate_limited_total"] += 1
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate_limited"},
+            headers={"Retry-After": "60", "Cache-Control": "no-store"},
+        )
+    response = await call_next(request)
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 def _get_cache(request: Request) -> CamsCache:
