@@ -7,7 +7,9 @@
 #      between it and the world. Caddy snippet:
 #
 #         uvdata.getbased.health {
-#           reverse_proxy localhost:8324
+#           reverse_proxy localhost:8324 {
+#             header_up X-Getbased-Client-IP {http.request.remote.host}
+#           }
 #         }
 #   4. Point Settings → Light & Sun → Sun Data Source at:
 #        https://<your-host>/uv  with the bearer you set above.
@@ -19,9 +21,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # The port is loopback-only and Caddy is the sole caller, so trust its
-      # normalized X-Forwarded-For address for per-client rate limiting.
-      UVDATA_TRUST_PROXY: "true"
+      # Caddy must overwrite this dedicated header from the socket peer. The
+      # app validates it as one IP and ignores ordinary X-Forwarded-For.
+      UVDATA_CLIENT_IP_HEADER: "x-getbased-client-ip"
       UVDATA_RATE_LIMIT_PER_MINUTE: "${UVDATA_RATE_LIMIT_PER_MINUTE:-300}"
     # 127.0.0.1 binding — public access goes through the host's reverse
     # proxy, so the container never speaks raw HTTP to the internet.

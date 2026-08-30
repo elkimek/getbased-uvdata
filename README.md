@@ -63,7 +63,7 @@ Then in the app: **Settings → Light & Sun → Sun Data Source → Self-hosted 
 | `MERGE_OPENMETEO` | `1` | Merge Open-Meteo clouds/temp/UVI into the response. Set `0` for CAMS-only — useful if you want fewer servers in the data path. |
 | `ALLOWED_ORIGINS` | _(empty)_ | Extra CORS origins (comma-separated) on top of `https://app.getbased.health` + `https://getbased.health`. Each must be `scheme://host[:port]`. |
 | `UVDATA_RATE_LIMIT_PER_MINUTE` | `300` | Per-source request cap for `/uv`, `/spectrum`, and `/metrics`; `0` disables it. |
-| `UVDATA_TRUST_PROXY` | _(empty)_ | Trust the left-most `X-Forwarded-For` value. The supplied loopback-only Docker deployment enables this because Caddy is its sole caller. |
+| `UVDATA_CLIENT_IP_HEADER` | _(empty)_ | Dedicated reverse-proxy-overwritten client-IP header used by the limiter. Compose sets `x-getbased-client-ip`; configure Caddy as shown in `docker-compose.yml`. Ordinary `X-Forwarded-For` is never trusted. |
 | `HOST` / `PORT` | `0.0.0.0` / `8324` | Listen address. |
 
 ## Endpoints

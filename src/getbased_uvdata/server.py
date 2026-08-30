@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+import ipaddress
 import logging
 import os
 import re
@@ -119,7 +120,10 @@ app.add_middleware(
 # client. Self-hosters can leave UVDATA_TRUST_PROXY unset and key on the direct
 # peer instead. The default is deliberately generous for shared networks.
 _RATE_LIMIT_PER_MINUTE = int(os.environ.get("UVDATA_RATE_LIMIT_PER_MINUTE", "300"))
-_TRUST_PROXY = os.environ.get("UVDATA_TRUST_PROXY", "").lower() in ("1", "true", "yes")
+_CLIENT_IP_HEADER = os.environ.get("UVDATA_CLIENT_IP_HEADER", "").strip().lower()
+if _CLIENT_IP_HEADER and not re.fullmatch(r"[a-z0-9-]+", _CLIENT_IP_HEADER):
+    logger.warning("Ignoring invalid UVDATA_CLIENT_IP_HEADER value")
+    _CLIENT_IP_HEADER = ""
 _RATE_BUCKETS: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _RATE_BUCKET_MAX = 10_000
 
@@ -141,11 +145,17 @@ def _rate_limit_check(ip: str, now: float | None = None, limit: int | None = Non
 
 
 def _request_ip(request: Request) -> str:
-    if _TRUST_PROXY:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            return forwarded.split(",", 1)[0].strip()[:64]
-    return (request.client.host if request.client else "unknown")[:64]
+    peer = request.client.host if request.client else "unknown"
+    candidate = request.headers.get(_CLIENT_IP_HEADER, "") if _CLIENT_IP_HEADER else peer
+    try:
+        return ipaddress.ip_address(candidate.strip()).compressed
+    except ValueError:
+        # Never let an attacker mint arbitrary bucket keys with a malformed or
+        # comma-separated forwarding value. Fall back to the socket peer.
+        try:
+            return ipaddress.ip_address(peer).compressed
+        except ValueError:
+            return "unknown"
 
 
 @app.middleware("http")

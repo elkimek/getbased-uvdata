@@ -557,6 +557,22 @@ class TestServer:
         assert not server_mod._rate_limit_check("198.51.100.1", now=12.0, limit=2)
         assert server_mod._rate_limit_check("198.51.100.1", now=71.0, limit=2)
 
+    def test_client_ip_uses_only_valid_proxy_overwritten_header(self, monkeypatch):
+        from getbased_uvdata import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_CLIENT_IP_HEADER", "x-getbased-client-ip")
+
+        class Request:
+            client = type("Client", (), {"host": "172.18.0.1"})()
+            headers = {
+                "x-forwarded-for": "198.51.100.99",
+                "x-getbased-client-ip": "203.0.113.7",
+            }
+
+        assert server_mod._request_ip(Request()) == "203.0.113.7"
+        Request.headers["x-getbased-client-ip"] = "203.0.113.7, 198.51.100.1"
+        assert server_mod._request_ip(Request()) == "172.18.0.1"
+
     def test_uv_returns_cams_fields(self, client_with_cache, monkeypatch):
         # Disable Open-Meteo merge so we don't make real outbound calls.
         monkeypatch.setenv("MERGE_OPENMETEO", "0")
