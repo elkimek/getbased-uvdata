@@ -4,6 +4,17 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-30
+
+### Fixed
+
+- CAMS refreshes no longer retain raw decoded grids beside normalized arrays. Live and persisted grids are normalized to float32 and xarray's decoded-array cache is disabled, eliminating the repeated 1.5 GiB cgroup OOM loop without reducing the global bounding box, five-day forecast, or response precision.
+
+### Security
+
+- Protected data routes now have a bounded per-source request limiter. The deployment uses a dedicated client-IP header which Caddy overwrites from the socket peer; ordinary caller-controlled `X-Forwarded-For` is ignored.
+- The runtime container now has a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, PID and memory boundaries, an init process, and a digest-pinned Python base image.
+
 ## [0.1.5] — 2026-05-11
 
 ### Fixed
