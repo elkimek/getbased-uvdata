@@ -561,6 +561,11 @@ class TestServer:
         from getbased_uvdata import server as server_mod
 
         monkeypatch.setattr(server_mod, "_CLIENT_IP_HEADER", "x-getbased-client-ip")
+        monkeypatch.setattr(
+            server_mod,
+            "_TRUSTED_PROXY_NETWORKS",
+            (server_mod.ipaddress.ip_network("172.16.0.0/12"),),
+        )
 
         class Request:
             client = type("Client", (), {"host": "172.18.0.1"})()
@@ -572,6 +577,22 @@ class TestServer:
         assert server_mod._request_ip(Request()) == "203.0.113.7"
         Request.headers["x-getbased-client-ip"] = "203.0.113.7, 198.51.100.1"
         assert server_mod._request_ip(Request()) == "172.18.0.1"
+
+    def test_client_ip_ignores_proxy_header_from_untrusted_peer(self, monkeypatch):
+        from getbased_uvdata import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_CLIENT_IP_HEADER", "x-getbased-client-ip")
+        monkeypatch.setattr(
+            server_mod,
+            "_TRUSTED_PROXY_NETWORKS",
+            (server_mod.ipaddress.ip_network("172.16.0.0/12"),),
+        )
+
+        class Request:
+            client = type("Client", (), {"host": "198.51.100.20"})()
+            headers = {"x-getbased-client-ip": "203.0.113.7"}
+
+        assert server_mod._request_ip(Request()) == "198.51.100.20"
 
     def test_uv_returns_cams_fields(self, client_with_cache, monkeypatch):
         # Disable Open-Meteo merge so we don't make real outbound calls.

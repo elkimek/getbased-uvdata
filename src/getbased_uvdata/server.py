@@ -115,15 +115,25 @@ app.add_middleware(
 )
 
 # Per-source request limiting lives in the application instead of relying on a
-# non-standard Caddy module. The hosted deployment is reachable only through
-# the local reverse proxy, so its left-most X-Forwarded-For address is the real
-# client. Self-hosters can leave UVDATA_TRUST_PROXY unset and key on the direct
-# peer instead. The default is deliberately generous for shared networks.
+# non-standard Caddy module. A dedicated proxy-overwritten header is accepted
+# only from explicitly trusted proxy networks; all other requests are keyed on
+# the socket peer. The default is deliberately generous for shared networks.
 _RATE_LIMIT_PER_MINUTE = int(os.environ.get("UVDATA_RATE_LIMIT_PER_MINUTE", "300"))
 _CLIENT_IP_HEADER = os.environ.get("UVDATA_CLIENT_IP_HEADER", "").strip().lower()
 if _CLIENT_IP_HEADER and not re.fullmatch(r"[a-z0-9-]+", _CLIENT_IP_HEADER):
     logger.warning("Ignoring invalid UVDATA_CLIENT_IP_HEADER value")
     _CLIENT_IP_HEADER = ""
+_TRUSTED_PROXY_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+_trusted_proxy_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+for raw in os.environ.get("UVDATA_TRUSTED_PROXY_CIDRS", "").split(","):
+    value = raw.strip()
+    if not value:
+        continue
+    try:
+        _trusted_proxy_networks.append(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        logger.warning("Ignoring invalid UVDATA_TRUSTED_PROXY_CIDRS entry: %r", raw)
+_TRUSTED_PROXY_NETWORKS = tuple(_trusted_proxy_networks)
 _RATE_BUCKETS: OrderedDict[str, tuple[float, int]] = OrderedDict()
 _RATE_BUCKET_MAX = 10_000
 
@@ -146,16 +156,21 @@ def _rate_limit_check(ip: str, now: float | None = None, limit: int | None = Non
 
 def _request_ip(request: Request) -> str:
     peer = request.client.host if request.client else "unknown"
-    candidate = request.headers.get(_CLIENT_IP_HEADER, "") if _CLIENT_IP_HEADER else peer
     try:
-        return ipaddress.ip_address(candidate.strip()).compressed
+        peer_ip = ipaddress.ip_address(peer.strip())
     except ValueError:
-        # Never let an attacker mint arbitrary bucket keys with a malformed or
-        # comma-separated forwarding value. Fall back to the socket peer.
-        try:
-            return ipaddress.ip_address(peer).compressed
-        except ValueError:
-            return "unknown"
+        return "unknown"
+
+    trusted_peer = any(peer_ip in network for network in _TRUSTED_PROXY_NETWORKS)
+    if not (_CLIENT_IP_HEADER and trusted_peer):
+        return peer_ip.compressed
+
+    candidate = request.headers.get(_CLIENT_IP_HEADER, "").strip()
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        # Never let a proxy bug or malformed value mint arbitrary bucket keys.
+        return peer_ip.compressed
 
 
 @app.middleware("http")

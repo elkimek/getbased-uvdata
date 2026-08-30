@@ -64,6 +64,7 @@ Then in the app: **Settings → Light & Sun → Sun Data Source → Self-hosted 
 | `ALLOWED_ORIGINS` | _(empty)_ | Extra CORS origins (comma-separated) on top of `https://app.getbased.health` + `https://getbased.health`. Each must be `scheme://host[:port]`. |
 | `UVDATA_RATE_LIMIT_PER_MINUTE` | `300` | Per-source request cap for `/uv`, `/spectrum`, and `/metrics`; `0` disables it. |
 | `UVDATA_CLIENT_IP_HEADER` | _(empty)_ | Dedicated reverse-proxy-overwritten client-IP header used by the limiter. Compose sets `x-getbased-client-ip`; configure Caddy as shown in `docker-compose.yml`. Ordinary `X-Forwarded-For` is never trusted. |
+| `UVDATA_TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated proxy source networks permitted to supply `UVDATA_CLIENT_IP_HEADER`. Compose trusts only the Docker bridge range and keeps the published port on loopback. Use a narrower CIDR for a fixed gateway. |
 | `HOST` / `PORT` | `0.0.0.0` / `8324` | Listen address. |
 
 ## Endpoints

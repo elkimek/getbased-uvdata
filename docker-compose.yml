@@ -22,13 +22,17 @@ services:
     env_file: .env
     environment:
       # Caddy must overwrite this dedicated header from the socket peer. The
-      # app validates it as one IP and ignores ordinary X-Forwarded-For.
+      # app validates it as one IP, accepts it only from a trusted proxy peer,
+      # and ignores ordinary X-Forwarded-For.
       UVDATA_CLIENT_IP_HEADER: "x-getbased-client-ip"
+      # Docker publishes host-originated proxy traffic from a 172.16/12 bridge
+      # gateway. Keep the port loopback-only; use a narrower CIDR when your
+      # deployment has a fixed gateway address.
+      UVDATA_TRUSTED_PROXY_CIDRS: "${UVDATA_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}"
       UVDATA_RATE_LIMIT_PER_MINUTE: "${UVDATA_RATE_LIMIT_PER_MINUTE:-300}"
     # 127.0.0.1 binding — public access goes through the host's reverse
-    # proxy, so the container never speaks raw HTTP to the internet.
-    # Self-hosters who want direct exposure (LAN-only, behind a separate
-    # firewall) can override to "0.0.0.0:8324:8324".
+    # proxy, so the container never speaks raw HTTP to the internet. Do not
+    # publish this port publicly while proxy-header trust is enabled.
     ports:
       - "127.0.0.1:8324:8324"
     volumes:
