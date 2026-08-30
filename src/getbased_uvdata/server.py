@@ -176,13 +176,29 @@ def _request_ip(request: Request) -> str:
 @app.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
     protected = request.url.path in ("/uv", "/spectrum", "/metrics")
-    if protected and not _rate_limit_check(_request_ip(request)):
-        _metrics["rate_limited_total"] += 1
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "rate_limited"},
-            headers={"Retry-After": "60", "Cache-Control": "no-store"},
-        )
+    if protected:
+        # Authenticate before consuming a source bucket. Otherwise an
+        # unauthenticated caller sharing an address with a legitimate client
+        # could exhaust that client's allowance without knowing the bearer.
+        try:
+            check_bearer(request)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+        if not _rate_limit_check(_request_ip(request)):
+            _metrics["rate_limited_total"] += 1
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "rate_limited"},
+                headers={"Retry-After": "60", "Cache-Control": "no-store"},
+            )
     response = await call_next(request)
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")

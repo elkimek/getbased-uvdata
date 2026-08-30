@@ -557,6 +557,21 @@ class TestServer:
         assert not server_mod._rate_limit_check("198.51.100.1", now=12.0, limit=2)
         assert server_mod._rate_limit_check("198.51.100.1", now=71.0, limit=2)
 
+    def test_unauthenticated_requests_do_not_consume_rate_bucket(
+        self, client_with_cache, monkeypatch
+    ):
+        from getbased_uvdata import server as server_mod
+
+        monkeypatch.setenv("GETBASED_UVDATA_BEARER", "rate-limit-secret")
+        server_mod._RATE_BUCKETS.clear()
+
+        first = client_with_cache.get("/uv?latitude=10&longitude=0")
+        second = client_with_cache.get("/uv?latitude=10&longitude=0")
+
+        assert first.status_code == 401
+        assert second.status_code == 401
+        assert not server_mod._RATE_BUCKETS
+
     def test_client_ip_uses_only_valid_proxy_overwritten_header(self, monkeypatch):
         from getbased_uvdata import server as server_mod
 

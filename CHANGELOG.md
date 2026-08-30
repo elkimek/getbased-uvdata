@@ -12,7 +12,7 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ### Security
 
-- Protected data routes now have a bounded per-source request limiter. The deployment uses a dedicated client-IP header which is accepted only from configured proxy networks and which Caddy overwrites from the socket peer; ordinary caller-controlled `X-Forwarded-For` is ignored.
+- Protected data routes now have a bounded per-source request limiter after bearer authentication, so unauthenticated traffic cannot consume valid clients' buckets. The deployment uses a dedicated client-IP header which is accepted only from configured proxy networks and which Caddy overwrites from the socket peer; ordinary caller-controlled `X-Forwarded-For` is ignored.
 - The runtime container now has a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, PID and memory boundaries, an init process, and a digest-pinned Python base image.
 
 ## [0.1.5] — 2026-05-11
