@@ -10,13 +10,14 @@ network on the request hot path.
 What we pull from CAMS:
   • total_column_ozone          → Dobson Units (drives UVB transmission)
   • total_aerosol_optical_depth → 550 nm AOD (modulates UVA/UVB scatter)
+  • uv biologically effective dose (total + clear sky) → direct CAMS UVI
   • particulate_matter_2.5um    → surface PM2.5, µg/m³
   • particulate_matter_10um     → surface PM10, µg/m³
 
-UV spectra come from `spectrum.reconstruct_spectrum` fed these CAMS
-values rather than from CAMS-McRad — the Solar Radiation Service is
-queue-based with pre-registered locations, structurally incompatible
-with synchronous per-coord serving.
+The direct CAMS erythemal-dose fields are the primary UVI anchor. The
+local spectrum reconstruction remains useful for wavelength-resolved
+wellness channels, but it no longer invents the headline UVI from only
+ozone and aerosol inputs.
 """
 
 from __future__ import annotations
@@ -69,6 +70,8 @@ _CAMS_DATASET = "cams-global-atmospheric-composition-forecasts"
 _CAMS_VARIABLES = [
     "total_column_ozone",
     "total_aerosol_optical_depth_550nm",
+    "uv_biologically_effective_dose",
+    "uv_biologically_effective_dose_clear_sky",
     "particulate_matter_2.5um",
     "particulate_matter_10um",
 ]
@@ -112,6 +115,8 @@ class GridSnapshot:
     lons: np.ndarray  # (LON,) — typically -180..180
     ozone_du: np.ndarray  # (T, LAT, LON) — Dobson Units
     aod_550: np.ndarray  # (T, LAT, LON) — unitless
+    uv_index: np.ndarray | None = None  # (T, LAT, LON) — CAMS total-sky UVI
+    uv_index_clear_sky: np.ndarray | None = None  # (T, LAT, LON) — CAMS clear-sky UVI
     pm2_5: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
     pm10: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
     no2: np.ndarray | None = None  # (T, LAT, LON) — µg/m³ (converted from kg/m³)
@@ -119,7 +124,7 @@ class GridSnapshot:
     co: np.ndarray | None = None  # (T, LAT, LON) — µg/m³
     o3_surface: np.ndarray | None = None  # (T, LAT, LON) — µg/m³ (tropospheric)
 
-    def lookup(self, lat: float, lon: float, when_epoch: float) -> dict[str, float | None]:
+    def lookup(self, lat: float, lon: float, when_epoch: float) -> dict[str, float | bool | None]:
         """Bilinear-interpolate the grid at (lat, lon, time). Returns {ozoneDU, aod}.
 
         Time axis snaps to the nearest forecast hour (CAMS leadtimes are
@@ -130,12 +135,23 @@ class GridSnapshot:
         topographic boundaries where ozone/AOD gradients are steep.
         """
         # ── time axis (nearest forecast hour) ────────────────────────
-        if when_epoch < self.times[0] or when_epoch > self.times[-1]:
+        time_in_range = bool(self.times[0] <= when_epoch <= self.times[-1])
+        if not time_in_range:
             ti = 0 if when_epoch < self.times[0] else len(self.times) - 1
         else:
-            ti = int(np.searchsorted(self.times, when_epoch))
-            if ti >= len(self.times):
+            right = int(np.searchsorted(self.times, when_epoch, side="left"))
+            if right <= 0:
+                ti = 0
+            elif right >= len(self.times):
                 ti = len(self.times) - 1
+            else:
+                left = right - 1
+                ti = (
+                    left
+                    if abs(when_epoch - float(self.times[left]))
+                    <= abs(float(self.times[right]) - when_epoch)
+                    else right
+                )
 
         # ── longitude wrap to the grid's domain ──────────────────────
         lon_wrapped = lon
@@ -151,16 +167,25 @@ class GridSnapshot:
         # If outside the grid's bounding box, fall back to nearest cell.
         if lat > self.lats[0] or lat < self.lats[-1]:
             li = int(np.argmin(np.abs(self.lats - lat)))
-            return self._cell(ti, li, self._nearest_lon_idx(lon_wrapped))
+            out = self._cell(ti, li, self._nearest_lon_idx(lon_wrapped))
+            out["_camsTimeInRange"] = time_in_range
+            out["_camsValidTime"] = float(self.times[ti])
+            return out
         if lon_wrapped < self.lons[0] or lon_wrapped > self.lons[-1]:
             gi = int(np.argmin(np.abs(self.lons - lon_wrapped)))
-            return self._cell(ti, self._nearest_lat_idx(lat), gi)
+            out = self._cell(ti, self._nearest_lat_idx(lat), gi)
+            out["_camsTimeInRange"] = time_in_range
+            out["_camsValidTime"] = float(self.times[ti])
+            return out
 
         # Find the two grid lines that bracket the point. For a degenerate
         # 1-row or 1-column grid (test fixtures, regional pulls), fall back
         # to nearest-cell — bilinear math collapses to identity anyway.
         if len(self.lats) < 2 or len(self.lons) < 2:
-            return self._cell(ti, self._nearest_lat_idx(lat), self._nearest_lon_idx(lon_wrapped))
+            out = self._cell(ti, self._nearest_lat_idx(lat), self._nearest_lon_idx(lon_wrapped))
+            out["_camsTimeInRange"] = time_in_range
+            out["_camsValidTime"] = float(self.times[ti])
+            return out
         diffs = np.abs(self.lats - lat)
         li_a, li_b = sorted(np.argsort(diffs)[:2].tolist())
 
@@ -193,9 +218,17 @@ class GridSnapshot:
             "ozoneDU": _bilin(self.ozone_du),
             "aod": _bilin(self.aod_550),
         }
+        if self.uv_index is not None:
+            value = _bilin(self.uv_index)
+            out["uvIndexCams"] = value if np.isfinite(value) else None
+        if self.uv_index_clear_sky is not None:
+            value = _bilin(self.uv_index_clear_sky)
+            out["uvClearSkyCams"] = value if np.isfinite(value) else None
         for key, arr in self._aq_arrays():
             if arr is not None:
                 out[key] = _bilin(arr)
+        out["_camsTimeInRange"] = time_in_range
+        out["_camsValidTime"] = float(self.times[ti])
         return out
 
     def _cell(self, ti: int, li: int, gi: int) -> dict[str, float | None]:
@@ -203,6 +236,12 @@ class GridSnapshot:
             "ozoneDU": float(self.ozone_du[ti, li, gi]),
             "aod": float(self.aod_550[ti, li, gi]),
         }
+        if self.uv_index is not None:
+            value = float(self.uv_index[ti, li, gi])
+            out["uvIndexCams"] = value if np.isfinite(value) else None
+        if self.uv_index_clear_sky is not None:
+            value = float(self.uv_index_clear_sky[ti, li, gi])
+            out["uvClearSkyCams"] = value if np.isfinite(value) else None
         for key, arr in self._aq_arrays():
             if arr is not None:
                 out[key] = float(arr[ti, li, gi])
@@ -308,16 +347,15 @@ class CamsCache:
                         logger.warning("Snapshot persist failed: %s", _redact_secrets(str(e)))
                 return True
             except Exception as e:  # noqa: BLE001 — we WANT to keep serving stale on failure
-                # Redact secrets BEFORE storing on the cache — the
-                # value flows into /healthz JSON, the X-Cams-Last-Error
-                # response header, and stdout via logger.exception.
+                # Redact secrets BEFORE storing or logging — cdsapi
+                # exception messages can contain a credential-bearing URL.
                 # cdsapi-style errors have a documented history of
                 # including the request URL with the API key embedded
                 # in their .args; keep them out of unauthenticated
                 # observability surfaces.
                 self._last_error = _redact_secrets(f"{type(e).__name__}: {e}")
                 self.pull_failures += 1
-                logger.exception("CAMS pull failed")
+                logger.error("CAMS pull failed: %s", self._last_error)
                 return False
 
     # ── Disk persistence ─────────────────────────────────────────────
@@ -353,6 +391,8 @@ class CamsCache:
         # snapshots remain compatible with newer code that gates on
         # `key in archive` instead of unconditional reads.
         for name, arr in (
+            ("uv_index", snap.uv_index),
+            ("uv_index_clear_sky", snap.uv_index_clear_sky),
             ("pm2_5", snap.pm2_5),
             ("pm10", snap.pm10),
             ("no2", snap.no2),
@@ -384,7 +424,7 @@ class CamsCache:
 
                 def _opt(key: str) -> np.ndarray | None:
                     # `key in data` is supported on NpzFile but cheap to be
-                    # defensive — older snapshots predate the AQ fields.
+                    # defensive — older snapshots predate optional fields.
                     return _grid(key) if key in data.files else None
 
                 self._snapshot = GridSnapshot(
@@ -396,6 +436,8 @@ class CamsCache:
                     lons=np.asarray(data["lons"], dtype=np.float32),
                     ozone_du=_grid("ozone_du"),
                     aod_550=_grid("aod_550"),
+                    uv_index=_opt("uv_index"),
+                    uv_index_clear_sky=_opt("uv_index_clear_sky"),
                     pm2_5=_opt("pm2_5"),
                     pm10=_opt("pm10"),
                     no2=_opt("no2"),
@@ -550,6 +592,10 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             "aod_550": "aod_550",  # already-correct passthrough
             "t550aer": "aod_550",
             "tau_550": "aod_550",  # forecast-product variant
+            "uvbed": "uv_bed",
+            "uv_biologically_effective_dose": "uv_bed",
+            "uvbedcs": "uv_bed_clear_sky",
+            "uv_biologically_effective_dose_clear_sky": "uv_bed_clear_sky",
             # Air-quality (surface) — CAMS short names are stable for
             # the AQ fields. Add aliases as Copernicus rotates them.
             "pm2p5": "pm2_5",
@@ -598,6 +644,32 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             raise RuntimeError(
                 f"CAMS aod_550 array has unexpected shape {aod.shape} after squeeze; expected (T, LAT, LON)"
             )
+
+        def _uvi(name: str) -> np.ndarray | None:
+            """Convert CAMS erythemal dose rate (W/m²) to WHO UVI.
+
+            CAMS names these fields "dose" but documents them as an
+            instantaneous biologically effective dose *rate*. One UVI
+            unit is 0.025 W/m², hence the fixed x40 conversion.
+            """
+            if name not in ds:
+                return None
+            arr = np.squeeze(ds[name].values).astype(float)
+            if arr.ndim != 3:
+                raise RuntimeError(
+                    f"CAMS {name} array has unexpected shape {arr.shape} after squeeze; "
+                    "expected (T, LAT, LON)"
+                )
+            arr = arr * 40.0
+            # Missing/fill values occasionally decode as huge finite
+            # numbers. Treat physically impossible UVI as unavailable;
+            # the merge layer can retain Open-Meteo for those cells.
+            arr[~np.isfinite(arr)] = np.nan
+            arr[(arr < 0) | (arr > 40)] = np.nan
+            return arr
+
+        uv_index = _uvi("uv_bed")
+        uv_index_clear_sky = _uvi("uv_bed_clear_sky")
 
         # Air-quality fields. CAMS units for these are kg/m³ at the
         # surface; convert to µg/m³ (1 kg/m³ = 1e9 µg/m³). Missing
@@ -657,6 +729,10 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             lats = lats[::-1]
             ozone = ozone[:, ::-1, :]
             aod = aod[:, ::-1, :]
+            if uv_index is not None:
+                uv_index = uv_index[:, ::-1, :]
+            if uv_index_clear_sky is not None:
+                uv_index_clear_sky = uv_index_clear_sky[:, ::-1, :]
             if pm2_5 is not None:
                 pm2_5 = pm2_5[:, ::-1, :]
             if pm10 is not None:
@@ -681,6 +757,10 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             times = times[order]
             ozone = ozone[order, :, :]
             aod = aod[order, :, :]
+            if uv_index is not None:
+                uv_index = uv_index[order, :, :]
+            if uv_index_clear_sky is not None:
+                uv_index_clear_sky = uv_index_clear_sky[order, :, :]
             if pm2_5 is not None:
                 pm2_5 = pm2_5[order, :, :]
             if pm10 is not None:
@@ -703,6 +783,8 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
             lons=lons,
             ozone_du=ozone,
             aod_550=aod,
+            uv_index=uv_index,
+            uv_index_clear_sky=uv_index_clear_sky,
             pm2_5=pm2_5,
             pm10=pm10,
             no2=no2,
