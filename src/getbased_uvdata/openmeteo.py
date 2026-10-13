@@ -49,13 +49,13 @@ _OPENMETEO_TIMEOUT_SEC = 5.0
 _LAST_GOOD_TTL_SEC = 30 * 60
 _FRESH_CACHE_TTL_SEC = 5 * 60
 _LAST_GOOD_MAX_ENTRIES = 256
-_LAST_GOOD: "OrderedDict[tuple, dict]" = OrderedDict()
+_LAST_GOOD: OrderedDict[tuple, dict] = OrderedDict()
 
 
 def _request_date(when_iso: str | None) -> dt.date:
     if when_iso:
         try:
-            return dt.datetime.fromisoformat(when_iso.replace("Z", "+00:00")).date()
+            return dt.datetime.fromisoformat(when_iso).date()
         except ValueError:
             pass
     return dt.datetime.now(dt.UTC).date()
@@ -281,8 +281,8 @@ async def fetch_openmeteo(
         if owned_client:
             try:
                 await c.aclose()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Open-Meteo client cleanup failed: %s", type(exc).__name__)
 
     if fresh:
         fresh["meta"] = {

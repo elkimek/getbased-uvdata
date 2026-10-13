@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import time
+from typing import ClassVar
 
 import httpx
 import numpy as np
@@ -694,7 +695,7 @@ class TestServer:
 
         class Request:
             client = type("Client", (), {"host": "172.18.0.1"})()
-            headers = {
+            headers: ClassVar[dict[str, str]] = {
                 "x-forwarded-for": "198.51.100.99",
                 "x-getbased-client-ip": "203.0.113.7",
             }
@@ -715,7 +716,7 @@ class TestServer:
 
         class Request:
             client = type("Client", (), {"host": "198.51.100.20"})()
-            headers = {"x-getbased-client-ip": "203.0.113.7"}
+            headers: ClassVar[dict[str, str]] = {"x-getbased-client-ip": "203.0.113.7"}
 
         assert server_mod._request_ip(Request()) == "198.51.100.20"
 
@@ -918,7 +919,6 @@ class TestOpenMeteoLastGoodFallback:
         """First request seeds the cache; second request, with a
         forecast that times out, falls back to the cached forecast
         instead of returning an empty dict."""
-        import asyncio
 
         from getbased_uvdata import openmeteo as om_mod
 
@@ -962,8 +962,6 @@ class TestOpenMeteoLastGoodFallback:
                     return FakeResp(good_forecast_json)
                 return FakeResp(good_aq_json)
 
-        import httpx  # noqa: F401  — used by FlakyClient typing/raise
-
         client = FlakyClient()
 
         # First call seeds the cache.
@@ -989,7 +987,6 @@ class TestOpenMeteoLastGoodFallback:
         """A cached entry older than the TTL is dropped — we don't
         want to serve hours-old forecasts indefinitely if Open-Meteo
         is genuinely down."""
-        import asyncio
         import time as _time
 
         from getbased_uvdata import openmeteo as om_mod
@@ -1033,7 +1030,6 @@ class TestOpenMeteoLastGoodFallback:
         forecast keeps refreshing itself on every failed request and
         never evicts — defeating _LAST_GOOD_TTL_SEC during sustained
         Open-Meteo outages."""
-        import asyncio
         import time as _time
 
         from getbased_uvdata import openmeteo as om_mod
@@ -1066,8 +1062,6 @@ class TestOpenMeteoLastGoodFallback:
 
                 return _R()
 
-        import httpx  # noqa: F401
-
         # Serve from cache — should NOT refresh stored_at.
         out = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFails()))
         assert "forecast" in out, "cache should fill in the missing forecast"
@@ -1086,7 +1080,6 @@ class TestOpenMeteoLastGoodFallback:
         a fresh timestamp. The fix instead merges fresh fields over the
         prior fresh entry, preserving the forecast's original
         `stored_at`."""
-        import asyncio
         import time as _time
 
         from getbased_uvdata import openmeteo as om_mod
@@ -1111,8 +1104,6 @@ class TestOpenMeteoLastGoodFallback:
                         return {"current": {"european_aqi": 42}}
 
                 return _R()
-
-        import httpx  # noqa: F401
 
         out = asyncio.run(om_mod.fetch_openmeteo(50.1, 14.4, client=ForecastFailsAqSucceeds()))
 
@@ -1141,7 +1132,6 @@ class TestOpenMeteoLastGoodFallback:
         pool=...)` replacement, which silently overrides the shared
         client's differentiated `Timeout(5.0, connect=3.0)` config and
         collapses connect back to 5s. Verify by capturing `get()` kwargs."""
-        import asyncio
 
         from getbased_uvdata import openmeteo as om_mod
 

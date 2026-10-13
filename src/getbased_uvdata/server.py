@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 import ipaddress
 import json
 import logging
@@ -11,6 +10,7 @@ import math
 import os
 import re
 import time as _time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import httpx
@@ -74,10 +74,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await app.state.openmeteo_client.aclose()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # Shutdown path — never let a cleanup error mask the real
-        # exit reason.
-        pass
+        # exit reason. Log only the type to avoid disclosing request URLs.
+        logger.warning("Open-Meteo client shutdown failed: %s", type(exc).__name__)
 
 
 app = FastAPI(title="getbased-uvdata", version=__version__, lifespan=lifespan)
