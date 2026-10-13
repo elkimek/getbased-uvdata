@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-
 # ── Wavelength grid (5 nm, 280-2500 nm) — matches js/sun-spectrum.js ───
 WAVELENGTHS: list[float] = [float(nm) for nm in range(280, 2505, 5)]
 

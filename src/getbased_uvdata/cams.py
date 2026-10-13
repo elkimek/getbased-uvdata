@@ -527,7 +527,7 @@ def _pull_cams_blocking(cache_dir: str | None = None) -> GridSnapshot:
     # available step.
     horizon_hours = int(os.environ.get("CAMS_FORECAST_HORIZON_HOURS", "120"))
     horizon_hours = max(24, min(120, horizon_hours))
-    leadtimes_set: set[int] = set(range(0, 25))
+    leadtimes_set: set[int] = set(range(25))
     leadtimes_set.update(range(27, horizon_hours + 1, 3))
     leadtimes = [str(h) for h in sorted(leadtimes_set)]
 

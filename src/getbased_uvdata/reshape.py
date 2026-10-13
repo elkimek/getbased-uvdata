@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import time
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .cams import GridSnapshot
@@ -32,7 +32,7 @@ def build_response(
     cams_pulled_at: float,
     snapshot_valid_from: float,
     snapshot_valid_to: float,
-    snapshot: "GridSnapshot | None" = None,
+    snapshot: GridSnapshot | None = None,
 ) -> dict[str, Any]:
     """Compose the JSON the browser sees."""
     when = _parse_iso(when_iso)
@@ -367,7 +367,7 @@ def _parse_iso(s: str | None) -> _dt.datetime:
     if not s:
         return _dt.datetime.now(_dt.UTC).replace(tzinfo=None)
     try:
-        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return _dt.datetime.fromisoformat(s)
     except ValueError:
         return _dt.datetime.now(_dt.UTC).replace(tzinfo=None)
 
@@ -380,7 +380,7 @@ def _open_meteo_time_to_epoch(t_str: str, utc_offset_s: float) -> float | None:
     if not isinstance(t_str, str):
         return None
     try:
-        d = _dt.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+        d = _dt.datetime.fromisoformat(t_str)
     except ValueError:
         return None
     if d.tzinfo is not None:
