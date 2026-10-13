@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-10-13
+
+### Changed
+
+- Updated the supported FastAPI (<0.144), Uvicorn (<0.55), and Ruff (<0.17) dependency ranges, and refreshed the digest-pinned Python 3.12 base image in both Docker build stages.
+- Client cleanup failures now log only the exception type, preserving request URL and credential privacy while making shutdown failures visible.
+
+### Fixed
+
+- Removed redundant test imports reported by CodeQL and resolved the lint and formatting issues exposed by Ruff 0.16.
+- Simplified ISO-8601 UTC parsing using Python 3.11+ native `Z` support while preserving explicit-offset and local hourly timestamp handling.
+
+
 ## [0.1.6] — 2026-08-30
 
 ### Added
