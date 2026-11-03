@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12"]
+        python: ["3.11", "3.12", "3.15"]
     steps:
       - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python }}
@@ -54,6 +54,10 @@ jobs:
           push: false
           load: true
           tags: getbased/uvdata:ci
+      - name: Verify runtime dependency imports
+        run: |
+          docker run --rm getbased/uvdata:ci python -c \
+            "import cdsapi, fastapi, netCDF4, numpy, xarray; import getbased_uvdata.server"
       - name: Sanity-check container starts
         # Boot the container with a fake CAMS_API_KEY so /healthz responds.
         # First pull will fail (auth rejected) but server stays up and
@@ -76,5 +80,10 @@ jobs:
           echo "$BODY"
           # Must be valid JSON with the expected schema.
           echo "$BODY" | python -c "import sys,json; d=json.load(sys.stdin); assert 'ok' in d and 'cams' in d and 'pulled_at' in d['cams']"
-          docker logs uvdata
-          docker stop uvdata
+      - name: Container logs and cleanup
+        if: always()
+        run: |
+          if docker container inspect uvdata > /dev/null 2>&1; then
+            docker logs uvdata
+            docker rm -f uvdata
+          fi

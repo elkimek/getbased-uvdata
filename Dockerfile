@@ -13,17 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir --prefix=/install .
+# Keep the interpreter's package directory and console scripts together so
+# Python minor-version updates cannot leave a stale PYTHONPATH behind.
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir .
 
 # ───────────────────────────────────────────────────────────────────────
 FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH=/install/bin:$PATH \
-    PYTHONPATH=/install/lib/python3.12/site-packages
+    PATH=/opt/venv/bin:$PATH
 
 # Only curl (for the healthcheck) + ca-certs (for HTTPS to CDS-API).
 # The netCDF4 / xarray Python wheels ship their own bundled libnetcdf
@@ -41,7 +43,7 @@ RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin uvdata 
     && mkdir -p /data \
     && chown uvdata:uvdata /data
 
-COPY --from=builder /install /install
+COPY --from=builder /opt/venv /opt/venv
 
 USER uvdata
 WORKDIR /home/uvdata
