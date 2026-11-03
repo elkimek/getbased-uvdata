@@ -17,4 +17,5 @@ data/
 *.nc
 tests/
 *.md
+!README.md
 LICENSE

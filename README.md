@@ -217,7 +217,7 @@ pytest                    # 32 tests, ~1 s
 ruff check src tests      # lint
 ```
 
-CI runs the matrix on Python 3.11 + 3.12 plus a Docker build smoke-boot — see `.github/workflows/ci.yml`.
+CI runs the matrix on Python 3.11, 3.12, and 3.15, plus Docker runtime import and startup checks — see `.github/workflows/ci.yml`. The Docker image uses Python 3.15.
 
 ## Security
 

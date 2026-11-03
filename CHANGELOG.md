@@ -4,6 +4,19 @@ All notable changes to this project will be documented here. Format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-11-03
+
+### Changed
+
+- Widened the supported FastAPI range to <0.163 and Ruff range to <0.18, incorporating Dependabot updates #44 and #41.
+- Upgraded both digest-pinned Docker stages from Python 3.12 to 3.15 (#43) and added Python 3.15 to the CI test matrix alongside 3.11 and 3.12.
+- CI now checks scientific/runtime dependency imports inside the built image and prints container logs during cleanup even when startup fails.
+
+### Fixed
+
+- Docker installs and copies a virtual environment instead of using a Python-version-specific `PYTHONPATH`, preventing the container startup failure introduced by the Python 3.15 image update.
+- Included the package README in the Docker build context before installation.
+
 ## [0.1.7] — 2026-10-13
 
 ### Changed
